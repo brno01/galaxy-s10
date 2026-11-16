@@ -1,0 +1,7 @@
+# Formato: uma chave pública SSH por linha (a mesma de ~/.ssh/nomad_ed25519.pub).
+# Linhas vazias e comentários (#) são ignorados pelo bootstrap.
+# Passe o arquivo REAL (fora do git) como argumento: sh bootstrap.sh /sdcard/s10-keys.pub
+# Só a chave do nomad: o atheron NUNCA faz login no Termux (o guardião só sonda o banner do sshd).
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE nomad
+# Opcional (adicione À MÃO em ~/.ssh/authorized_keys, depois do bootstrap): chave só para o túnel do VNC.
+# permitopen="127.0.0.1:5900",restrict,port-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE nomad-vnc

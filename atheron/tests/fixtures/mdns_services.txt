@@ -1,0 +1,4 @@
+List of discovered mdns services
+adb-OTHERDEV01-abc123	_adb-tls-connect._tcp	192.0.2.50:44444
+adb-EXAMPLESERIAL-pneVN5	_adb-tls-connect._tcp	192.0.2.30:41234
+adb-EXAMPLESERIAL-pneVN5	_adb-tls-pairing._tcp	192.0.2.30:39999

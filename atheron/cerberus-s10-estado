@@ -1,0 +1,3 @@
+#!/bin/sh
+# Forced command of the s10tunnel SSH key: the only thing that key can run is "print the state".
+exec cat /run/cerberus-s10/estado.json

@@ -1,0 +1,1143 @@
+#!/usr/bin/env python3
+"""cerberus-s10: monitor + guardian for the Galaxy S10 plugged into the atheron USB port.
+
+Every S10_INTERVAL seconds (default 30) it makes sure the (loopback-only) adb server
+is up, lists the devices, collects battery / wakefulness / Wi-Fi, and, when the S10
+is 'device', enforces (read first, write only on drift) the settings that keep the
+three access paths alive (USB, wireless adb, droidVNC-NG over Termux sshd). It then
+probes each path and atomically writes /run/cerberus-s10/estado.json. Repairs and
+path up/down transitions go to stderr (journald); secrets never do. Runs as a
+non-root user: everything on the phone goes through `adb shell` (uid shell).
+Stdlib only. Decisions and parsing are pure so they are tested with fixtures.
+"""
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+
+SAMSUNG_MODEL_PREFIX = "SM_"
+STATUS = {1: "unknown", 2: "charging", 3: "discharging", 4: "not_charging", 5: "full"}
+HEALTH = {1: "unknown", 2: "good", 3: "overheat", 4: "dead", 5: "over_voltage",
+          6: "failure", 7: "cold"}
+KNOWN_STATES = ("device", "unauthorized", "offline")
+
+
+# ---------------------------------------------------------------- parsing (pure)
+def parse_devices(text):
+    """Parse `adb devices -l` into [{serial, state, model}]."""
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("List of devices", "*")):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        model = ""
+        for tok in parts[2:]:
+            if tok.startswith("model:"):
+                model = tok[6:]
+        out.append({"serial": parts[0], "state": parts[1], "model": model})
+    return out
+
+
+def select_device(devices, serial=None):
+    """Return the S10 entry, or None. Configured serial wins; otherwise the
+    single device, otherwise the single Samsung (model SM_*) one."""
+    if serial:
+        for d in devices:
+            if d["serial"] == serial:
+                return d
+        return None
+    if len(devices) == 1:
+        return devices[0]
+    sam = [d for d in devices if d["model"].startswith(SAMSUNG_MODEL_PREFIX)]
+    return sam[0] if len(sam) == 1 else None
+
+
+def parse_battery(text):
+    """Parse `dumpsys battery`. Returns dict or None if no level was found."""
+    kv = {}
+    for line in text.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            kv[k.strip()] = v.strip()
+
+    def num(key):
+        try:
+            return int(kv[key])
+        except (KeyError, ValueError):
+            return None
+
+    level = num("level")
+    if level is None:
+        return None
+    scale = num("scale") or 100
+    temp = num("temperature")
+    plugged = [name for key, name in (("AC powered", "ac"), ("USB powered", "usb"),
+                                      ("Wireless powered", "wireless"),
+                                      ("Dock powered", "dock"))
+               if kv.get(key) == "true"]
+    status = num("status")
+    health = num("health")
+    return {
+        "nivel": round(level * 100 / scale),
+        "temperatura_c": None if temp is None else temp / 10.0,
+        "status": STATUS.get(status, "unknown"),
+        "plugado": plugged,
+        "saude": HEALTH.get(health, "unknown"),
+        "tensao_mv": num("voltage"),
+    }
+
+
+def parse_wakefulness(text):
+    m = re.search(r"mWakefulness=(\w+)", text)
+    return m.group(1) if m else None
+
+
+def parse_wifi(text):
+    """Parse `dumpsys wifi`: enabled flag and whether an SSID is associated."""
+    m = re.search(r"Wi-Fi is (enabled|disabled)", text)
+    if not m:
+        return None
+    conectado = False
+    s = re.search(r'mWifiInfo SSID: ("?)([^,"]*)\1,', text)
+    if s and "<unknown ssid>" not in s.group(2) and s.group(2):
+        conectado = True
+    return {"ligado": m.group(1) == "enabled", "conectado": conectado}
+
+
+# ---------------------------------------------------------------- state machine
+class Alerts:
+    """Turns successive snapshots into de-duplicated warning messages."""
+
+    def __init__(self, temp_max=45.0, full_hours=24.0, repeat_s=3600.0):
+        self.temp_max = temp_max
+        self.full_s = full_hours * 3600
+        self.repeat_s = repeat_s
+        self.last_estado = None
+        self.last_warn = {}   # key -> epoch of last emitted warning
+        self.full_since = None
+
+    def _due(self, key, now):
+        last = self.last_warn.get(key)
+        if last is None or now - last >= self.repeat_s:
+            self.last_warn[key] = now
+            return True
+        return False
+
+    def evaluate(self, snap, now):
+        msgs = []
+        estado = snap["estado"]
+        if estado != "device":
+            self.full_since = None
+            if self._due("estado", now) or estado != self.last_estado:
+                self.last_warn["estado"] = now
+                msgs.append("S10 %s (not usable over adb)" % estado)
+        else:
+            self.last_warn.pop("estado", None)
+            if self.last_estado not in (None, "device"):
+                msgs.append("S10 back to 'device'")
+        self.last_estado = estado
+
+        bat = snap.get("bateria")
+        if estado == "device" and bat:
+            t = bat.get("temperatura_c")
+            if t is not None and t >= self.temp_max:
+                if self._due("temp", now):
+                    msgs.append("S10 temperature %.1f C >= %.0f C" % (t, self.temp_max))
+            else:
+                self.last_warn.pop("temp", None)
+            if bat["nivel"] >= 100:
+                if self.full_since is None:
+                    self.full_since = now
+                if now - self.full_since >= self.full_s and self._due("full", now):
+                    msgs.append("S10 at 100%% for >%dh: battery protection probably off"
+                                % (self.full_s // 3600))
+            else:
+                self.full_since = None
+                self.last_warn.pop("full", None)
+        return msgs
+
+
+# ---------------------------------------------------------------- IO
+def write_atomic(path, data, mode=0o644):
+    """Write JSON to `path` atomically (tmp file in same dir + fsync + rename)."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".estado-", dir=d)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+MAX_OUT = 1 << 20      # cap on captured stdout (L3)
+MAX_XML = 512 << 10    # cap on a uiautomator dump
+
+
+def default_run(cmd, timeout=15, input_text=None):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input_text,
+                           errors="replace")
+        return p.returncode, p.stdout[:MAX_OUT]
+    except (OSError, subprocess.TimeoutExpired):
+        return 255, ""
+
+
+def collect(run, adb="adb", serial=None, now=None, server_args=()):
+    """Build the estado.json snapshot. `run(cmd)->(rc, stdout)` is injectable."""
+    now = time.time() if now is None else now
+    snap = {
+        "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
+        "epoch": int(now),
+        "conectado": False,
+        "estado": "ausente",
+        "serial": None,
+        "bateria": None,
+        "tela": None,
+        "wifi": None,
+    }
+    rc, _ = run([adb] + list(server_args) + ["start-server"])  # no-op if running; unix socket only (no TCP :5037)
+    rc, out = run([adb, "devices", "-l"])
+    dev = select_device(parse_devices(out), serial) if rc == 0 else None
+    if dev is None:
+        return snap
+    snap["serial"] = dev["serial"]
+    snap["estado"] = dev["state"] if dev["state"] in KNOWN_STATES else "offline"
+    if dev["state"] != "device":
+        return snap
+    snap["conectado"] = True
+    sh = [adb, "-s", dev["serial"], "shell"]
+    snap["bateria"] = parse_battery(run(sh + ["dumpsys", "battery"])[1])
+    snap["tela"] = parse_wakefulness(run(sh + ["dumpsys", "power"])[1])
+    snap["wifi"] = parse_wifi(run(sh + ["dumpsys", "wifi"])[1])
+    return snap
+
+
+# ---------------------------------------------------------------- guardian: parsing (pure)
+PKG_TAILSCALE = "com.tailscale.ipn"
+PKG_TERMUX = "com.termux"
+PKG_TERMUX_BOOT = "com.termux.boot"
+PKG_VNC = "net.christianbeier.droidvnc_ng"
+PKG_SHIZUKU = "moe.shizuku.privileged.api"
+VNC_PERMS = ("android.permission.WRITE_EXTERNAL_STORAGE", "android.permission.READ_EXTERNAL_STORAGE")
+WIFI_CONFIRM_FOCUS = "com.android.systemui/com.android.systemui.wifi.WifiDebuggingActivity"
+UI_DUMP = "/data/local/tmp/cerberus-ui.xml"   # shell-owned, not world-writable like /sdcard
+SYSTEMUI_PKG = "com.android.systemui"
+VNC_TOGGLE_ID = PKG_VNC + ":id/toggle"
+VNC_MAIN_PREFIX = PKG_VNC + "/"
+TERMUX_ACTIVITY = "com.termux/.app.TermuxActivity"
+START_LABELS = ("começar", "comecar", "start")
+SHIZUKU_START = ("d=$(dirname $(pm path %s | cut -d: -f2)); $d/lib/arm64/libshizuku.so" % PKG_SHIZUKU)
+IDLE_WHITELIST = (PKG_TAILSCALE, PKG_TERMUX, PKG_TERMUX_BOOT, PKG_VNC)
+VNC_SERVICE = PKG_VNC + "/.MainService"
+VNC_INPUT_SERVICE = PKG_VNC + "/.InputService"
+LOOPBACK = ("127.0.0.1", "[::1]", "::1")
+KEY_RE = re.compile(r"^[A-Za-z0-9._~-]{4,128}$")
+PASS_RE = re.compile(r"^[A-Za-z0-9]{8}$")          # VNC authentication only uses 8 characters
+COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.]+/[A-Za-z0-9_.$]+$")
+
+
+def parse_setting(text):
+    """`settings get`: returns the value, "" when unset ('null'/empty)."""
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    v = lines[-1] if lines else ""
+    return "" if v == "null" else v
+
+
+def parse_wifi_status(text):
+    """`cmd wifi status`: True/False, None if unrecognised."""
+    m = re.search(r"Wifi is (enabled|disabled)", text, re.I)
+    return None if not m else m.group(1).lower() == "enabled"
+
+
+def parse_pid(text):
+    """`pidof`: True when at least one pid was printed."""
+    return bool(re.search(r"^\d+(\s+\d+)*\s*$", text.strip()))
+
+
+def parse_tls_port(text):
+    """`getprop service.adb.tls.port`: port or None (empty/0 = wireless debugging off)."""
+    try:
+        p = int(text.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+    return p if 0 < p < 65536 else None
+
+
+def parse_wifi_ip(text):
+    """`ip -f inet addr show wlan0`: first IPv4 address or None."""
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/", text)
+    return m.group(1) if m else None
+
+
+def parse_listening(text):
+    """`ss -ltn` -> {port: set(local addresses)}."""
+    out = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0] != "LISTEN":
+            continue
+        addr, _, port = parts[3].rpartition(":")
+        if port.isdigit():
+            out.setdefault(int(port), set()).add(addr)
+    return out
+
+
+def parse_mdns_services(text, serial):
+    """`adb mdns services` -> [(ip, port)] of the S10's wireless-debugging service
+    (`adb-<serial>-<suffix>  _adb-tls-connect._tcp  <ip>:<port>`); other devices are ignored."""
+    out = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or "_adb-tls-connect" not in parts[1]:
+            continue
+        if serial and not parts[0].startswith("adb-%s-" % serial):
+            continue
+        m = re.match(r"^(\d+\.\d+\.\d+\.\d+):(\d+)$", parts[2])
+        if m:
+            out.append((m.group(1), int(m.group(2))))
+    return out
+
+
+def parse_avahi_tls(text, serial):
+    """`avahi-browse -rpt _adb-tls-connect._tcp` (resolved lines start with '=') -> [(ip, port)]."""
+    out = []
+    for line in text.splitlines():
+        f = line.split(";")
+        if len(f) < 9 or f[0] != "=" or f[2] != "IPv4":
+            continue
+        if serial and not f[3].startswith("adb-%s-" % serial):
+            continue
+        if f[8].isdigit():
+            out.append((f[7], int(f[8])))
+    return out
+
+
+def parse_logcat_tls_port(text):
+    """Last `Received tls port=N` in a logcat dump (adbd logs it every time wireless debugging is
+    enabled; the property is empty on this One UI build). Only 1024-65535 is accepted."""
+    ports = [int(p) for p in re.findall(r"Received tls port=(\d+)", text)]
+    ports = [p for p in ports if 1024 <= p <= 65535]
+    return ports[-1] if ports else None
+
+
+def parse_whitelist(text, pkg):
+    """`dumpsys deviceidle whitelist`: lines look like `user,<pkg>,<uid>`."""
+    return any(("," + pkg + ",") in (ln.strip() + ",") for ln in text.splitlines())
+
+
+def parse_appop(text, op):
+    m = re.search(r"\b%s: (\w+)" % re.escape(op), text)
+    return m.group(1) if m else None
+
+
+def parse_resolve_activity(text):
+    """`cmd package resolve-activity --brief`: the last `pkg/.Activity` line."""
+    comps = [ln.strip() for ln in text.splitlines() if COMPONENT_RE.match(ln.strip())]
+    return comps[-1] if comps else None
+
+
+def has_a11y_service(current, pkg):
+    return any(s.split("/")[0] == pkg for s in current.split(":") if s)
+
+
+def merge_a11y(current, service):
+    """Append `service` to the colon-separated list without clobbering others."""
+    if has_a11y_service(current, service.split("/")[0]):
+        return current
+    return service if not current else current + ":" + service
+
+
+def parse_focus(text):
+    """`dumpsys window | grep mCurrentFocus` (+ `dumpsys activity activities | grep mResumedActivity`) -> 'pkg/Activity'
+    or None. Right after a reboot the window focus can be null while the dialog is the resumed activity (seen live with
+    WifiDebuggingActivity), so the resumed activity is the fallback; a short '.Name' is expanded with the package."""
+    m = re.search(r"mCurrentFocus=Window\{\S+ \S+ ([\w.$]+/[\w.$]+)\}", text)
+    if m:
+        return m.group(1)
+    m = re.search(r"mResumedActivity: ActivityRecord\{\S+ \S+ ([\w.$]+)/([\w.$]+)", text)
+    if m:
+        pkg, act = m.groups()
+        return pkg + "/" + (pkg + act if act.startswith(".") else act)
+    return None
+
+
+def parse_ui_nodes(xml_text, package=None):
+    """`uiautomator dump` XML -> {resource-id: {"checked", "text", "package", "bounds"}}.
+    With `package`, only nodes of that package count. An id that appears more than once among the
+    considered nodes is ambiguous and dropped (another app could spoof a button). Oversized or
+    DTD/entity-bearing XML is refused."""
+    if len(xml_text) > MAX_XML or "<!DOCTYPE" in xml_text or "<!ENTITY" in xml_text:
+        return {}
+    try:
+        root = ET.fromstring(xml_text.strip())
+    except ET.ParseError:
+        return {}
+    seen, out = {}, {}
+    for n in root.iter("node"):
+        rid = n.get("resource-id")
+        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]$", n.get("bounds", ""))
+        if not rid or not m or (package and n.get("package") != package):
+            continue
+        seen[rid] = seen.get(rid, 0) + 1
+        out[rid] = {"checked": n.get("checked") == "true", "text": n.get("text", ""),
+                    "package": n.get("package", ""),
+                    "bounds": tuple(int(g) for g in m.groups())}
+    return {k: v for k, v in out.items() if seen[k] == 1}
+
+
+def center(bounds):
+    l, t, r, b = bounds
+    return (l + r) // 2, (t + b) // 2
+
+
+def plan_confirm_taps(nodes):
+    """Taps for the 'Allow wireless debugging on this network?' dialog, or None when either the
+    'always allow' checkbox or the positive button is missing (then nothing is tapped).
+    The checkbox is tapped only if unchecked; the button last."""
+    box, ok = nodes.get("android:id/alwaysUse"), nodes.get("android:id/button1")
+    if not box or not ok:
+        return None
+    taps = [] if box["checked"] else [center(box["bounds"])]
+    return taps + [center(ok["bounds"])]
+
+
+def is_start_label(text):
+    """True only for the droidVNC-NG toggle saying START/COMEÇAR; PARAR/STOP/anything else never."""
+    return text.strip().lower() in START_LABELS
+
+
+def plan_vnc_toggle_tap(nodes):
+    """Center of the droidVNC-NG toggle iff it currently offers to START the server."""
+    n = nodes.get(VNC_TOGGLE_ID)
+    return center(n["bounds"]) if n and is_start_label(n["text"]) else None
+
+
+def parse_wifi_ssid(text):
+    """Current SSID from `cmd wifi status` ('connected to "x"' or 'SSID: "x"'), None if not connected."""
+    m = re.search(r'connected to "([^"]*)"', text) or re.search(r'SSID: "([^"]*)"', text)
+    return m.group(1) if m and m.group(1) != "<unknown ssid>" else None
+
+
+def parse_wifi_bssid(text):
+    """Current BSSID from `cmd wifi status` (`BSSID: aa:bb:...`), lower-cased, or None."""
+    m = re.search(r"BSSID: ((?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})", text)
+    return m.group(1).lower() if m else None
+
+
+def parse_pkg_signature(text):
+    """`dumpsys package <pkg> | grep -A1 -i signatures` -> digest string of the signing certificate(s)
+    (PackageSignatures `signatures:[hash,...]`), or None. Compared as an opaque pinned value."""
+    m = re.search(r"signatures:\[([0-9a-fA-F, ]+)\]", text)
+    if not m:
+        return None
+    return ",".join(sorted(x.strip().lower() for x in m.group(1).split(",") if x.strip())) or None
+
+
+class Pins:
+    """Trust-on-first-use store of package signing digests (/var/lib/cerberus-s10/pins.json)."""
+
+    def __init__(self, path=None):
+        self.path, self.pins = path, {}
+        if path:
+            try:
+                with open(path) as f:
+                    self.pins = {k: v for k, v in json.load(f).items() if isinstance(v, str)}
+            except (OSError, ValueError, AttributeError):
+                self.pins = {}
+
+    def check(self, pkg, digest):
+        """'ok' | 'new' (first sight: pinned now) | 'mismatch' | 'unknown' (digest unreadable)."""
+        if not digest:
+            return "unknown"
+        known = self.pins.get(pkg)
+        if known is None:
+            self.pins[pkg] = digest
+            if self.path:
+                try:
+                    write_atomic(self.path, self.pins, 0o600)
+                except OSError:
+                    pass
+            return "new"
+        return "ok" if known == digest else "mismatch"
+
+
+def parse_perm_granted(text, perm):
+    m = re.search(r"%s: granted=(true|false)" % re.escape(perm), text)
+    return None if not m else m.group(1) == "true"
+
+
+def parse_shizuku_running(text):
+    return any("shizuku_server" in ln and "grep" not in ln for ln in text.splitlines())
+
+
+def read_secret(path, rx=None):
+    """Read a secret file (never logged). Returns the value if it matches `rx`, else None."""
+    try:
+        with open(path) as f:
+            key = f.read(256).strip()
+    except OSError:
+        return None
+    return key if (rx or KEY_RE).match(key) else None
+
+
+def read_password(path):
+    return read_secret(path, PASS_RE)
+
+
+# ---------------------------------------------------------------- guardian: decisions (pure)
+def plan_repairs(obs, cfg):
+    """Decide repairs from an observation dict. Returns a list of actions:
+    {"id", "why", "cmds": [argv...] | None, "script": str | None, "cooldown": bool}.
+    A value of None in `obs` means 'could not be read': never repaired blindly.
+    Only drift produces an action (read first, write only on drift)."""
+    acts = []
+
+    def act(aid, why, cmds=None, script=None, cooldown=False, fn=None, verify=None):
+        acts.append({"id": aid, "why": why, "cmds": cmds, "script": script, "cooldown": cooldown, "fn": fn,
+                     "verify": verify})
+
+    if obs.get("stay_on") is not None and obs["stay_on"] != "7":
+        act("stay_on", "stay_on_while_plugged_in=%r -> 7" % obs["stay_on"],
+            [["settings", "put", "global", "stay_on_while_plugged_in", "7"]])
+    if obs.get("wifi") is False:
+        act("wifi", "Wi-Fi disabled -> svc wifi enable", [["svc", "wifi", "enable"]])
+    if obs.get("adb_wifi") is not None and obs["adb_wifi"] != "1":
+        act("adb_wifi", "adb_wifi_enabled=%r -> 1" % obs["adb_wifi"],
+            [["settings", "put", "global", "adb_wifi_enabled", "1"]])
+    if obs.get("vpn_app") is not None and obs["vpn_app"] != PKG_TAILSCALE:
+        act("vpn_app", "always_on_vpn_app=%r -> %s" % (obs["vpn_app"], PKG_TAILSCALE),
+            [["settings", "put", "secure", "always_on_vpn_app", PKG_TAILSCALE]])
+    if obs.get("vpn_lockdown") is not None and obs["vpn_lockdown"] != "0":
+        act("vpn_lockdown", "always_on_vpn_lockdown=%r -> 0" % obs["vpn_lockdown"],
+            [["settings", "put", "secure", "always_on_vpn_lockdown", "0"]])
+    if obs.get("ts_alive") is False:
+        comp = obs.get("ts_activity")
+        if comp and COMPONENT_RE.match(comp):
+            act("tailscale_start", "%s not running -> am start" % PKG_TAILSCALE,
+                [["am", "start", "-n", comp]], cooldown=True)
+        else:
+            act("tailscale_unresolved", "%s not running and launcher not resolved" % PKG_TAILSCALE)
+    for pkg in IDLE_WHITELIST:
+        if obs.get("idle", {}).get(pkg) is False:
+            act("idle_" + pkg, "%s not in the doze whitelist" % pkg,
+                [["dumpsys", "deviceidle", "whitelist", "+" + pkg]])
+    if obs.get("projection") is not None and obs["projection"] != "allow":
+        act("projection", "PROJECT_MEDIA=%r -> allow" % obs["projection"],
+            [["appops", "set", PKG_VNC, "PROJECT_MEDIA", "allow"]])
+    a11y = obs.get("a11y_services")
+    if a11y is not None and not has_a11y_service(a11y, PKG_VNC):
+        act("a11y_service", "accessibility service %s missing (append)" % VNC_INPUT_SERVICE,
+            [["settings", "put", "secure", "enabled_accessibility_services",
+              merge_a11y(a11y, VNC_INPUT_SERVICE)]])
+    if obs.get("a11y_enabled") is not None and obs["a11y_enabled"] != "1":
+        act("a11y_enabled", "accessibility_enabled=%r -> 1" % obs["a11y_enabled"],
+            [["settings", "put", "secure", "accessibility_enabled", "1"]])
+    ports = obs.get("ports")
+    if ports is not None:
+        if cfg["vnc_port"] not in ports:
+            key, pw = obs.get("vnc_key"), obs.get("vnc_password")
+            if key and pw:
+                act("vnc_start", "droidVNC-NG not listening on :%d -> ACTION_START" % cfg["vnc_port"],
+                    script=vnc_start_script(key, cfg["vnc_port"], cfg["vnc_iface"], pw), cooldown=True,
+                    verify=PKG_VNC)
+            elif key:
+                # a key exists: never fall back to the unprotected UI start; refuse until a password exists too
+                act("vnc_nopass", "droidVNC-NG down; access key set but /etc/cerberus-s10/vnc-password missing: "
+                    "not starting without a VNC password")
+            elif not cfg["allow_unprotected"]:
+                act("vnc_off", "VNC desligado até rodar user-step-s10.sh --vnc-key (sem chave de acesso não há como "
+                    "iniciar o droidVNC-NG com senha)")
+            else:
+                # explicit opt-in (S10_ALLOW_UNPROTECTED_VNC=1): press the app's own start button instead
+                act("vnc_start", "droidVNC-NG not listening on :%d and no valid access key file -> UI start button "
+                    "(VNC is UNPROTECTED until the key is set: user-step-s10.sh --vnc-key)" % cfg["vnc_port"],
+                    cooldown=cfg["ui_cooldown_s"], fn="vnc_ui", verify=PKG_VNC)
+        exposed = [a for a in ports.get(cfg["vnc_port"], ()) if a not in LOOPBACK]
+        if exposed and not (obs.get("vnc_key") and obs.get("vnc_password")):
+            act("vnc_exposed_stop", "droidVNC-NG listens on %s without a configured VNC password -> force-stop"
+                % ",".join(sorted(exposed)), [["am", "force-stop", PKG_VNC]])
+        if cfg["ssh_port"] not in ports:
+            # RUN_COMMAND is refused for the shell uid: open Termux (its ~/.bashrc hook starts sshd + guardian)
+            act("termux_start", "Termux sshd not listening on :%d -> open Termux" % cfg["ssh_port"],
+                cooldown=cfg["ui_cooldown_s"], fn="termux_ui")
+    for perm, granted in sorted((obs.get("vnc_perms") or {}).items()):
+        if granted is False:
+            act("grant_" + perm.rsplit(".", 1)[1], "%s not granted to droidVNC-NG" % perm,
+                [["pm", "grant", PKG_VNC, perm]])
+    if obs.get("shizuku") is False:
+        act("shizuku", "shizuku_server not running -> libshizuku.so", [[SHIZUKU_START]], cooldown=True,
+            verify=PKG_SHIZUKU)
+    return acts
+
+
+def vnc_start_script(key, port, iface, password=None):
+    """Script fed to `adb shell` over stdin so the key/password never appear in an argv on the atheron."""
+    if not KEY_RE.match(key):
+        raise ValueError("invalid access key")
+    if password is not None and not PASS_RE.match(password):
+        raise ValueError("invalid VNC password")
+    ns = PKG_VNC + "."
+    parts = ["am", "start-foreground-service", "-n", VNC_SERVICE,
+             "-a", ns + "ACTION_START",
+             "--es", ns + "EXTRA_ACCESS_KEY", "'%s'" % key,
+             "--ei", ns + "EXTRA_PORT", str(int(port))]
+    if password is not None:
+        parts += ["--es", ns + "EXTRA_PASSWORD", "'%s'" % password]
+    if iface:
+        if not re.match(r"^[A-Za-z0-9_.-]+$", iface):
+            raise ValueError("invalid interface")
+        parts += ["--es", ns + "EXTRA_INTERFACE", iface]
+    return " ".join(parts) + "\nexit\n"
+
+
+class Transitions:
+    """Logs a path going up/down once (and its first observation), not every cycle."""
+
+    def __init__(self):
+        self.last = {}
+
+    def update(self, name, ok):
+        if ok is None:
+            return None
+        prev = self.last.get(name)
+        self.last[name] = ok
+        if prev is None or prev != ok:
+            return "path %s: %s" % (name, "up" if ok else "down")
+        return None
+
+
+class AdbRecovery:
+    """Exponential backoff for adb restarts when the S10 is not 'device'.
+    `adb reconnect` at 30 s, 60 s, 120 s ... capped at `cap`; kill-server/start-server
+    at most every `restart_every` seconds and only after a reconnect failed."""
+
+    def __init__(self, base=30.0, cap=300.0, restart_every=300.0):
+        self.base, self.cap, self.restart_every = base, cap, restart_every
+        self.reset()
+
+    def reset(self):
+        self.fails = 0
+        self.next_try = 0.0
+        self.last_restart = None
+
+    def step(self, estado, now):
+        if estado == "device":
+            self.reset()
+            return []
+        if now < self.next_try:
+            return []
+        acts = []
+        if self.fails >= 1 and (self.last_restart is None or now - self.last_restart >= self.restart_every):
+            acts.append("restart-server")
+            self.last_restart = now
+        else:
+            acts.append("reconnect-offline" if estado == "offline" else "reconnect")
+        self.next_try = now + min(self.cap, self.base * (2 ** self.fails))
+        self.fails += 1
+        return acts
+
+
+# ---------------------------------------------------------------- guardian: IO
+def tcp_probe(host, port, timeout=2.0, banner=None, connect=socket.create_connection):
+    """True if a TCP connection succeeds (and, if `banner`, the peer starts with it)."""
+    try:
+        with connect((host, port), timeout) as s:
+            if banner:
+                s.settimeout(timeout)
+                return s.recv(len(banner)) == banner
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def ping_probe(ip, run=None):
+    run = run or default_run
+    rc, _ = run(["ping", "-c1", "-W2", ip], timeout=6)
+    return rc == 0
+
+
+def guard_config(env):
+    return {
+        "tailnet_ip": env.get("S10_TAILNET_IP", "100.64.0.10"),
+        "ts_probe": env.get("S10_TS_PROBE", "ping"),       # ping | off
+        "ssh_port": int(env.get("S10_SSH_PORT", "8022")),
+        "vnc_port": int(env.get("S10_VNC_PORT", "5900")),
+        "vnc_iface": env.get("S10_VNC_IFACE", "lo"),       # '' = all interfaces
+        "key_file": env.get("S10_VNC_KEY_FILE") or os.path.join(
+            env.get("CREDENTIALS_DIRECTORY", "/etc/cerberus-s10"), "vnc-access-key"),
+        "pass_file": env.get("S10_VNC_PASSWORD_FILE") or os.path.join(
+            env.get("CREDENTIALS_DIRECTORY", "/etc/cerberus-s10"), "vnc-password"),
+        "home_ssid": env.get("S10_HOME_SSID", "homenet"),
+        "home_bssid": env.get("S10_HOME_BSSID", "02:00:00:00:00:ab").lower(),
+        "allow_unprotected": env.get("S10_ALLOW_UNPROTECTED_VNC", "0") == "1",
+        "pins_file": env.get("S10_PINS", "/var/lib/cerberus-s10/pins.json"),
+        "repair": env.get("S10_REPAIR", "1") != "0",
+        "cooldown_s": float(env.get("S10_COOLDOWN", "120")),
+        "wifi_iface": env.get("S10_WIFI_IFACE", "wlan0"),
+        "mdns_serial": env.get("S10_MDNS_SERIAL", "EXAMPLESERIAL"),
+        "regen_cooldown_s": float(env.get("S10_REGEN_COOLDOWN", "600")),
+        "ui_cooldown_s": float(env.get("S10_UI_COOLDOWN", "180")),
+        "stick_s": float(env.get("S10_STICK_WAIT", "3")),   # wait before checking a re-enable stuck
+    }
+
+
+class Guardian:
+    """Enforces the S10 settings and tracks the health of the three access paths.
+    `run(cmd, input_text=None, timeout=15) -> (rc, stdout)` and `probes` are injectable."""
+
+    def __init__(self, run, cfg, adb="adb", serial=None, probes=None, logf=None, read_key=read_secret,
+                 sleep=time.sleep, read_pass=read_password, server_args=()):
+        self.run, self.cfg, self.adb, self.serial = run, cfg, adb, serial
+        self.probes = probes or {
+            "ping": ping_probe,
+            "tcp": tcp_probe,
+        }
+        self.logf = logf or (lambda m: None)
+        self.read_key = read_key
+        self.read_pass = read_pass
+        self.server_args = list(server_args)
+        self.pins = Pins(cfg.get("pins_file"))
+        self.sleep = sleep
+        self.last_ativa = None
+        self.trans = Transitions()
+        self.recovery = AdbRecovery()
+        self.last_try = {}
+        self.once = set()
+        self.reparos = []
+        self.last_ip = None
+        self.last_port = None
+
+    # -- helpers
+    def log(self, msg):
+        self.logf(msg)
+
+    def warn_once(self, key, msg):
+        if key not in self.once:
+            self.once.add(key)
+            self.log(msg)
+
+    def _shell(self, serial, args, input_text=None, timeout=15):
+        cmd = [self.adb, "-s", serial, "shell"] + list(args)
+        if input_text is None:
+            return self.run(cmd)
+        return self.run(cmd, input_text=input_text, timeout=timeout)
+
+    def seed(self, previous):
+        """Reuse the last published ip/port after a restart (estado.json lives in /run)."""
+        try:
+            aw = previous["caminhos"]["adb_sem_fio"]
+            self.last_ip, self.last_port = aw.get("ip_lan") or aw.get("ip"), aw.get("porta")
+        except (KeyError, TypeError):
+            pass
+
+    # -- observation
+    def observe(self, serial):
+        def get(args):
+            rc, out = self._shell(serial, args)
+            return (out if rc == 0 else None)
+
+        def setting(ns, name):
+            out = get(["settings", "get", ns, name])
+            return None if out is None else parse_setting(out)
+
+        obs = {
+            "stay_on": setting("global", "stay_on_while_plugged_in"),
+            "adb_wifi": setting("global", "adb_wifi_enabled"),
+            "vpn_app": setting("secure", "always_on_vpn_app"),
+            "vpn_lockdown": setting("secure", "always_on_vpn_lockdown"),
+            "a11y_services": setting("secure", "enabled_accessibility_services"),
+            "a11y_enabled": setting("secure", "accessibility_enabled"),
+        }
+        out = get(["cmd", "wifi", "status"])
+        obs["wifi"] = None if out is None else parse_wifi_status(out)
+        # pidof exits 1 when not running, so only rc 0/1 with empty output counts as "not alive"
+        rc, out = self._shell(serial, ["pidof", PKG_TAILSCALE])
+        obs["ts_alive"] = parse_pid(out) if rc in (0, 1) else None
+        if obs["ts_alive"] is False:
+            out = get(["cmd", "package", "resolve-activity", "--brief", PKG_TAILSCALE])
+            obs["ts_activity"] = parse_resolve_activity(out or "")
+        out = get(["dumpsys", "deviceidle", "whitelist"])
+        obs["idle"] = {} if out is None else {p: parse_whitelist(out, p) for p in IDLE_WHITELIST}
+        out = get(["appops", "get", PKG_VNC, "PROJECT_MEDIA"])
+        obs["projection"] = None if out is None else (parse_appop(out, "PROJECT_MEDIA") or "default")
+        out = get(["ss", "-ltn"])
+        obs["ports"] = None if (out is None or not out.strip()) else parse_listening(out)
+        out = get(["pm", "path", PKG_SHIZUKU])
+        if out is not None and "package:" in out:
+            ps = get(["ps -A | grep shizuku_server"])
+            obs["shizuku"] = parse_shizuku_running(ps or "")
+        else:
+            obs["shizuku"] = None       # not installed: nothing to start
+        out = get(["dumpsys package %s | grep -E '_EXTERNAL_STORAGE: granted'" % PKG_VNC])
+        obs["vnc_perms"] = {p: parse_perm_granted(out or "", p) for p in VNC_PERMS}
+        obs["tls_port"] = parse_tls_port(get(["getprop", "service.adb.tls.port"]) or "")
+        obs["wifi_ip"] = parse_wifi_ip(get(["ip", "-f", "inet", "addr", "show", self.cfg["wifi_iface"]]) or "")
+        return obs
+
+    def _cooldown_ok(self, aid, now, cooldown=None):
+        last = self.last_try.get(aid)
+        if last is not None and now - last < (self.cfg["cooldown_s"] if cooldown is None else cooldown):
+            return False
+        self.last_try[aid] = now
+        return True
+
+    def verify_pkg(self, serial, pkg):
+        """Trust-on-first-use pin of the package signing digest before handing it secrets or starting it."""
+        rc, out = self._shell(serial, ["dumpsys package %s | grep -i -A1 signatures" % pkg])
+        digest = parse_pkg_signature(out) if rc == 0 else None
+        verdict = self.pins.check(pkg, digest)
+        if verdict == "new":
+            self.log("pinned signing digest of %s (first use)" % pkg)
+        elif verdict == "mismatch":
+            self.warn_once("pin_" + pkg, "WARNING signing certificate of %s CHANGED: refusing to use it "
+                           "(remove its entry from the pins file only if the update was yours)" % pkg)
+        elif verdict == "unknown":
+            self.warn_once("pinunk_" + pkg, "WARNING cannot read the signing digest of %s: refusing" % pkg)
+        return verdict in ("ok", "new")
+
+    # -- UI-driven repairs (no secrets: they press the apps' own buttons)
+    def _focus(self, serial):
+        rc, out = self._shell(serial, ["dumpsys window | grep mCurrentFocus; dumpsys activity activities | grep -m1 mResumedActivity"])
+        return parse_focus(out) if rc == 0 else None
+
+    def _ui_nodes(self, serial, package):
+        self._shell(serial, ["uiautomator", "dump", UI_DUMP])
+        rc, xml_text = self._shell(serial, ["head -c %d %s" % (MAX_XML, UI_DUMP)])
+        self._shell(serial, ["rm", "-f", UI_DUMP])
+        return parse_ui_nodes(xml_text, package) if rc == 0 else {}
+
+    def _tap(self, serial, xy):
+        self._shell(serial, ["input", "tap", str(xy[0]), str(xy[1])])
+
+    def _listening(self, serial, port):
+        rc, out = self._shell(serial, ["ss", "-ltn"])
+        return rc == 0 and port in parse_listening(out)
+
+    def vnc_ui(self, serial, now):
+        """Open droidVNC-NG and press START (only if the toggle says so; MediaProjection consent is
+        pre-granted by appops, never tapped here), then go HOME and re-check the port."""
+        self._shell(serial, ["am", "start", "-n", PKG_VNC + "/.MainActivity"])
+        self.sleep(2)
+        focus = self._focus(serial)
+        if not (focus or "").startswith(VNC_MAIN_PREFIX):
+            self._shell(serial, ["input", "keyevent", "3"])
+            return "droidVNC-NG not in focus (%s); nothing tapped" % focus
+        tap, seen = None, False
+        for attempt in range(3):                      # the button may be below the fold: up to 2 swipes
+            nodes = self._ui_nodes(serial, PKG_VNC)
+            seen = VNC_TOGGLE_ID in nodes
+            tap = plan_vnc_toggle_tap(nodes)
+            if seen or attempt == 2:
+                break
+            self._shell(serial, ["input", "swipe", "360", "1300", "360", "300", "300"])
+            self.sleep(1)
+        if tap is not None:
+            self._tap(serial, tap)
+            what = "tapped START"
+        else:
+            what = "toggle not offering START (%s)" % ("seen" if seen else "not found")
+        self._shell(serial, ["input", "keyevent", "3"])
+        self.sleep(5)
+        return "%s; port %s" % (what, "up" if self._listening(serial, self.cfg["vnc_port"]) else "still down")
+
+    def termux_ui(self, serial, now):
+        """Open Termux: its ~/.bashrc hook (bootstrap.sh) starts sshd and the phone guardian."""
+        rc, out = self._shell(serial, ["cmd", "package", "resolve-activity", "--brief", PKG_TERMUX])
+        comp = parse_resolve_activity(out) if rc == 0 else None
+        self._shell(serial, ["am", "start", "-n", comp or TERMUX_ACTIVITY])
+        self.sleep(5)
+        up = self._listening(serial, self.cfg["ssh_port"])
+        self._shell(serial, ["input", "keyevent", "3"])
+        return "Termux opened; sshd %s" % ("up" if up else "still down")
+
+    def logcat_port(self, serial):
+        rc, out = self._shell(serial, ["logcat -d -b all | grep -o 'Received tls port=[0-9]*' | tail -1"])
+        return parse_logcat_tls_port(out) if rc == 0 else None
+
+    def regenerate_port(self, serial, now):
+        """The log line rotated out of the buffer and no other source knows the port: toggle wireless
+        debugging so adbd logs a fresh one (drops any wireless session; at most once per 10 min)."""
+        if not self.cfg["repair"] or not self._cooldown_ok("adb_wifi_port", now, self.cfg["regen_cooldown_s"]):
+            return None
+        self._shell(serial, ["settings", "put", "global", "adb_wifi_enabled", "0"])
+        self.sleep(2)
+        self._shell(serial, ["settings", "put", "global", "adb_wifi_enabled", "1"])
+        self.sleep(3)
+        p = self.logcat_port(serial)
+        self.log("REPAIR adb_wifi_port: no TLS port known, toggled wireless debugging (port %s)" % (p or "not found"))
+        self.reparos.append({"epoch": int(now), "id": "adb_wifi_port", "rc": 0})
+        if p:
+            self.last_port = p
+        return p
+
+    def discover_tls(self, serial):
+        """Port of the wireless-debugging service (random, only advertised on the LAN by mDNS; the
+        `service.adb.tls.port` property is empty on this build): the atheron's own adb server first,
+        then avahi-browse. Returns (ip, port) or None."""
+        want = self.cfg["mdns_serial"] or serial
+        rc, out = self.run([self.adb, "mdns", "services"])
+        found = parse_mdns_services(out, want) if rc == 0 else []
+        if not found:
+            rc, out = self.run(["avahi-browse", "-rpt", "_adb-tls-connect._tcp"])
+            found = parse_avahi_tls(out, want) if rc == 0 else []
+        return found[0] if found else None
+
+    # -- repairs
+    def repair(self, serial, obs, now):
+        if "vnc_key" not in obs:
+            obs["vnc_key"] = self.read_key(self.cfg["key_file"])
+            obs["vnc_password"] = self.read_pass(self.cfg["pass_file"])
+        done = []
+        for a in plan_repairs(obs, self.cfg):
+            if a["id"] in ("tailscale_unresolved", "vnc_nopass", "vnc_off"):
+                self.warn_once(a["id"], "WARNING %s" % a["why"])
+                continue
+            if not self.cfg["repair"]:
+                self.warn_once("dry_" + a["id"], "drift (repair off): %s" % a["why"])
+                continue
+            if a["cooldown"] and not self._cooldown_ok(a["id"], now, None if a["cooldown"] is True else a["cooldown"]):
+                continue
+            if a["verify"] and not self.verify_pkg(serial, a["verify"]):
+                continue
+            if a["fn"]:
+                if a["fn"] == "vnc_ui":
+                    self.warn_once("vnc_nokey", "WARNING %s" % a["why"])
+                res = getattr(self, a["fn"])(serial, now)
+                self.log("REPAIR %s: %s (%s)" % (a["id"], a["why"], res))
+                done.append(a["id"])
+                self.reparos.append({"epoch": int(now), "id": a["id"], "rc": 0})
+                continue
+            rc = 0
+            for cmd in a["cmds"] or []:
+                rc, _ = self._shell(serial, cmd)
+            if a["script"] is not None:
+                rc, _ = self._shell(serial, [], input_text=a["script"])
+            self.log("REPAIR %s: %s (rc=%s)" % (a["id"], a["why"], rc))
+            if a["id"] == "adb_wifi":
+                self.check_stuck(serial, now)
+            done.append(a["id"])
+            self.reparos.append({"epoch": int(now), "id": a["id"], "rc": rc})
+        self.reparos = self.reparos[-20:]
+        return done
+
+    def check_stuck(self, serial, now):
+        """Android turns wireless debugging off again on networks not yet confirmed (after every reboot
+        it asks 'Allow wireless debugging on this network?'): accept that dialog over USB, then re-check."""
+        self.sleep(self.cfg["stick_s"])
+        if self._adb_wifi_on(serial):
+            self.once.discard("stuck")
+            return True
+        if self.confirm_wifi_dialog(serial, now) and self._adb_wifi_on(serial):
+            self.once.discard("stuck")
+            return True
+        self.warn_once("stuck", "WARNING rede não confiável para depuração sem fio "
+                       "(adb_wifi_enabled voltou a 0): marque 'Sempre permitir nesta rede'")
+        return False
+
+    def _adb_wifi_on(self, serial):
+        rc, out = self._shell(serial, ["settings", "get", "global", "adb_wifi_enabled"])
+        return not (rc == 0 and parse_setting(out) != "1")
+
+    def confirm_wifi_dialog(self, serial, now):
+        """Tap 'always allow' + 'Permitir' only when the focused window is exactly the wireless-debugging
+        confirmation and both widgets were found in a uiautomator dump. At most once per cooldown."""
+        rc, out = self._shell(serial, ["dumpsys window | grep mCurrentFocus; dumpsys activity activities | grep -m1 mResumedActivity"])
+        if rc != 0 or parse_focus(out) != WIFI_CONFIRM_FOCUS:
+            return False
+        if not self._cooldown_ok("adb_wifi_confirm", now):
+            return False
+        rc, st = self._shell(serial, ["cmd", "wifi", "status"])
+        ssid = parse_wifi_ssid(st) if rc == 0 else None
+        bssid = parse_wifi_bssid(st) if rc == 0 else None
+        if ssid != self.cfg["home_ssid"] or bssid != self.cfg["home_bssid"]:
+            self.warn_once("ssid", "WARNING wireless debugging dialog on network %r (%s), not the home network "
+                           "%r (%s): not accepting it" % (ssid, bssid, self.cfg["home_ssid"], self.cfg["home_bssid"]))
+            return False
+        nodes = self._ui_nodes(serial, SYSTEMUI_PKG)
+        msg = nodes.get("android:id/message")
+        if msg and ssid not in [ln.strip().strip('"') for ln in msg["text"].splitlines()]:  # the dialog shows "ssid" quoted
+            self.warn_once("ssid_dialog", "WARNING dialog text does not name the home network exactly: not tapping")
+            return False
+        taps = plan_confirm_taps(nodes)
+        if taps is None:
+            self.log("WARNING wireless debugging dialog in focus but its widgets were not found; not tapping")
+            return False
+        if self._focus(serial) != WIFI_CONFIRM_FOCUS:       # focus may have moved while we dumped the UI
+            self.log("WARNING focus left the wireless debugging dialog before tapping; not tapping")
+            return False
+        for x, y in taps:
+            self._shell(serial, ["input", "tap", str(x), str(y)])
+        self.log("REPAIR adb_wifi_confirm: tapped %d point(s) on the wireless debugging dialog" % len(taps))
+        self.reparos.append({"epoch": int(now), "id": "adb_wifi_confirm", "rc": 0})
+        self.sleep(1)
+        return True
+
+    def recover_adb(self, estado, now):
+        for a in self.recovery.step(estado, now):
+            if a == "restart-server":
+                self.log("adb recovery: kill-server + start-server (device %s)" % estado)
+                self.run([self.adb, "kill-server"])
+                self.run([self.adb] + self.server_args + ["start-server"])
+            else:
+                self.log("adb recovery: %s (device %s)" % (a.replace("-", " "), estado))
+                self.run([self.adb] + a.split("-"))
+
+    # -- one cycle
+    def cycle(self, snap, now):
+        """Mutates `snap` (adds caminhos/guardiao) and returns the list of log lines emitted."""
+        lines = []
+        old_log = self.logf
+        self.logf = lambda m: (lines.append(m), old_log(m))
+        try:
+            return self._cycle(snap, now, lines)
+        finally:
+            self.logf = old_log
+
+    def _cycle(self, snap, now, lines):
+        cfg = self.cfg
+        usb = snap["estado"] == "device"
+        obs = None
+        self.recover_adb(snap["estado"], now)
+        if usb:
+            obs = self.observe(snap["serial"])
+            done = self.repair(snap["serial"], obs, now)
+            if obs["wifi_ip"]:
+                self.last_ip = obs["wifi_ip"]
+            on = obs["adb_wifi"] == "1"
+            if "adb_wifi" in done:
+                on = self._adb_wifi_on(snap["serial"])
+            if obs["adb_wifi"] is not None:
+                self.last_ativa = on
+            if obs["tls_port"]:
+                self.last_port = obs["tls_port"]
+            elif not on:
+                self.last_port = None
+            if on:
+                # primary source: adbd logs "Received tls port=N" over USB (mDNS is invisible from the atheron)
+                p = self.logcat_port(snap["serial"])
+                if p:
+                    self.last_port = p
+                    obs["tls_port"] = obs["tls_port"] or p
+        if self.last_ativa is not False and not (usb and obs and obs["tls_port"]):
+            found = self.discover_tls(snap["serial"])
+            if found:
+                if not (usb and obs and obs["wifi_ip"]):
+                    self.last_ip = found[0]
+                self.last_port = found[1]
+        if usb and self.last_ativa and self.last_port is None:
+            self.regenerate_port(snap["serial"], now)
+        ip, port = self.last_ip, self.last_port
+        tcp, ping = self.probes["tcp"], self.probes["ping"]
+        tail_ok = None
+        if ip and port:
+            tail_ok = bool(tcp(cfg["tailnet_ip"], port))
+            aw_ok = tail_ok or bool(tcp(ip, port))
+        elif usb and self.last_ativa:
+            aw_ok = None   # enabled, but this One UI build does not expose the TLS port: nomad finds it via mDNS
+        else:
+            aw_ok = False if usb else None
+        if cfg["ts_probe"] == "off":
+            ts_ok = None
+        else:
+            ts_ok = bool(ping(cfg["tailnet_ip"]))
+        ssh_ok = tcp(cfg["tailnet_ip"], cfg["ssh_port"], banner=b"SSH-")
+        ports = obs["ports"] if obs else None
+        vnc_ok = None if ports is None else cfg["vnc_port"] in ports
+        loopback = None
+        if vnc_ok:
+            loopback = all(a in LOOPBACK for a in ports[cfg["vnc_port"]])
+            if not loopback:
+                self.warn_once("vnc_exposed", "WARNING VNC :%d listens on a non-loopback address" % cfg["vnc_port"])
+        snap["caminhos"] = {
+            "usb": {"ok": usb, "estado": snap["estado"]},
+            "adb_sem_fio": {"ip_lan": ip, "porta": port, "ip_tailnet": cfg["tailnet_ip"], "ok": aw_ok,
+                            "ok_tailnet": tail_ok, "ativa": self.last_ativa},
+            "tailscale": {"ok": ts_ok, "ip": cfg["tailnet_ip"]},
+            "ssh_termux": {"ok": ssh_ok, "porta": cfg["ssh_port"]},
+            "vnc": {"ok": vnc_ok, "porta": cfg["vnc_port"], "loopback": loopback},
+        }
+        shizuku = None if obs is None else obs.get("shizuku")
+        snap["guardiao"] = {"reparos": list(self.reparos), "reparar": cfg["repair"],
+                            "shizuku": {"ok": shizuku}}
+        for name, ok in (("shizuku", shizuku), ("usb", usb), ("adb_sem_fio", aw_ok), ("tailscale", ts_ok),
+                         ("ssh_termux", ssh_ok), ("vnc", vnc_ok)):
+            msg = self.trans.update(name, ok)
+            if msg:
+                self.log(msg)
+        return lines
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    env = os.environ
+    adb = env.get("S10_ADB", "adb")
+    serial = env.get("S10_SERIAL") or None
+    interval = float(env.get("S10_INTERVAL", "30"))
+    path = env.get("S10_STATE", "/run/cerberus-s10/estado.json")
+    alerts = Alerts(float(env.get("S10_TEMP_MAX", "45")), float(env.get("S10_FULL_HOURS", "24")))
+    sock = env.get("S10_ADB_SOCKET", "/run/cerberus-s10/adb.sock")
+    server_args = ["-L", "localfilesystem:" + sock] if sock else []
+    if sock:
+        os.environ["ADB_SERVER_SOCKET"] = "localfilesystem:" + sock   # every adb client below talks to it
+    guardian = Guardian(default_run, guard_config(env), adb, serial, logf=lambda m: log(m),
+                        server_args=server_args)
+    try:
+        with open(path) as f:
+            guardian.seed(json.load(f))
+    except (OSError, ValueError):
+        pass
+    keys = env.get("ADB_VENDOR_KEYS")
+    if keys:
+        try:
+            os.makedirs(keys, mode=0o700, exist_ok=True)
+        except OSError as e:
+            log("warning: cannot create %s: %s" % (keys, e))
+    once = "--once" in argv
+    while True:
+        try:
+            snap = collect(default_run, adb, serial, server_args=server_args)
+            if sock:
+                try:
+                    os.chmod(sock, 0o660)    # group cerberus-s10 (tunnel user) may connect; nobody else
+                except OSError:
+                    pass
+            try:
+                guardian.cycle(snap, snap["epoch"])
+            except Exception as e:  # a guardian bug must not stop the estado.json
+                log("guardian error: %r" % (e,))
+            write_atomic(path, snap, 0o640)
+            for m in alerts.evaluate(snap, snap["epoch"]):
+                log("WARNING " + m)
+        except Exception as e:  # keep the loop alive; systemd Restart is the backstop
+            log("error: %r" % (e,))
+            if once:
+                return 1
+        if once:
+            return 0
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

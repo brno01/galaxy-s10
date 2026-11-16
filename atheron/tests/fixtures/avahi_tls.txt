@@ -1,0 +1,3 @@
+=;wlan0;IPv6;adb-EXAMPLESERIAL-pneVN5;_adb-tls-connect._tcp;local;s10.local;fe80::1;41234;"x"
+=;wlan0;IPv4;adb-EXAMPLESERIAL-pneVN5;_adb-tls-connect._tcp;local;s10.local;192.0.2.30;41234;"x"
+=;wlan0;IPv4;adb-OTHER-zz;_adb-tls-connect._tcp;local;o.local;192.0.2.50;44444;"x"

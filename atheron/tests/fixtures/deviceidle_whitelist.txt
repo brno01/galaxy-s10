@@ -1,0 +1,4 @@
+system-excidle,com.android.shell,2000
+system,com.android.providers.downloads,10043
+user,com.tailscale.ipn,10311
+user,com.termux,10312

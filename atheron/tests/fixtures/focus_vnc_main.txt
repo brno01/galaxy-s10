@@ -1,0 +1,1 @@
+mCurrentFocus=Window{abc u0 net.christianbeier.droidvnc_ng/net.christianbeier.droidvnc_ng.MainActivity}

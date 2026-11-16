@@ -1,0 +1,520 @@
+#!/bin/bash
+# s10: controla o Galaxy S10 (tela quebrada) por três caminhos independentes, com queda automática.
+# Uso: s10 [status|setup-vnc] [--usb|--sem-fio|--vnc|--lan] [--rapido] [--desktop] [-- <args extras do scrcpy>]
+#   (sem args) automático: 1) USB via atheron  2) adb sem fio direto  3) VNC por túnel SSH ao Termux
+#   status     mostra cada caminho (✓/✗), o motivo e a latência de uma sonda rápida
+#   setup-vnc  busca UMA vez a senha do VNC no atheron (ssh admin) e grava em ~/.config/s10/vnc-password (0600)
+#   --usb      só o caminho 1: scrcpy pelo adb do atheron (túnel SSH para o socket unix do adb; sem TCP exposto)
+#   --sem-fio  só o caminho 2: adb connect pela tailnet (porta publicada pelo atheron; LAN/mDNS só como reserva) + scrcpy
+#   --vnc      só o caminho 3: ssh -p 8022 -L 5901:127.0.0.1:5900 até o Termux + cliente VNC
+#   --lan      usa o adb local do nomad com um aparelho sem fio JÁ conectado (sem ssh)
+#   --rapido   max-size 1024, 4M, h264 (menor latência); padrão = qualidade: 1440, 8M, 60 fps, h264
+#   --desktop  display virtual 1920x1080/160 com o modo desktop do AOSP (liga force_desktop_mode_on_external_displays
+#              e enable_freeform_support antes; na 1ª vez pode precisar reiniciar o celular). Não é o Samsung DeX
+#              de verdade (esse exige HDMI ou o app DeX do Windows)
+#   --audio    liga o áudio no caminho USB (desligado por padrão: o áudio pelo túnel SSH derruba a sessão)
+# Ambiente: S10_TUNNEL (s10tunnel@atheron: usuário restrito do túnel e do estado), S10_ATHERON (root@atheron:
+#   só manutenção/setup-vnc; se definido e S10_TUNNEL não, também é usado no túnel), S10_SERIAL, S10_PHONE (galaxy-s10),
+#   S10_TAILNET_IP (100.64.0.10), S10_TERMUX_USER (u0_a999),
+#   S10_SSH_PORT (8022), S10_SSH_KEY (~/.ssh/nomad_ed25519, usada se existir),
+#   S10_VNC_PASSWORD_FILE (~/.config/s10/vnc-password), S10_CLIP_SECONDS (30),
+#   S10_VNC_LPORT (5901), S10_VNC_RPORT (5900), S10_CONNECT_TIMEOUT (3), S10_CODEC (h264)
+set -u
+
+ADMIN_HOST=${S10_ATHERON:-root@atheron}                    # só manutenção (setup-vnc)
+HOST=${S10_TUNNEL:-${S10_ATHERON:-s10tunnel@atheron}}      # túnel + estado: usuário restrito
+# inside s10tunnel's home: Tailscale SSH rejects forwarding sockets outside the user's home (link made by the installer)
+ADB_REMOTE_SOCK=${S10_ADB_REMOTE_SOCK:-/home/s10tunnel/adb.sock}
+RUNDIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+LSOCK=$RUNDIR/s10-adb.sock
+VNC_PASS_FILE=${S10_VNC_PASSWORD_FILE:-$HOME/.config/s10/vnc-password}
+CLIP_SECS=${S10_CLIP_SECONDS:-30}
+PWTMP=
+SERIAL=${S10_SERIAL:-}
+DEFAULT_SERIAL=EXAMPLESERIAL   # S10 no USB do atheron (usado só se estiver na lista e S10_SERIAL vazio)
+SCRPORT=27183      # porta do vídeo do scrcpy, encaminhada pelo túnel (--force-adb-forward)
+PHONE=${S10_PHONE:-galaxy-s10}
+TAILNET_IP=${S10_TAILNET_IP:-100.64.0.10}
+TERMUX_USER=${S10_TERMUX_USER-u0_a999}
+SSH_KEY=${S10_SSH_KEY:-$HOME/.ssh/nomad_ed25519}
+KEY_ARGS=()
+[ -f "$SSH_KEY" ] && KEY_ARGS=(-i "$SSH_KEY" -o IdentitiesOnly=yes)   # a mesma chave em todo ssh do s10
+CODEC=${S10_CODEC:-h264}   # h265 + decodificação por software no nomad é mais lento
+AUDIO=0                    # áudio pelo túnel SSH derruba a sessão: só com --audio
+SSH_PORT=${S10_SSH_PORT:-8022}
+VNC_LPORT=${S10_VNC_LPORT:-5901}
+VNC_RPORT=${S10_VNC_RPORT:-5900}
+CT=${S10_CONNECT_TIMEOUT:-3}
+STATE_REMOTE=/run/cerberus-s10/estado.json
+CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/s10
+CACHE=$CACHE_DIR/estado.json
+MODE=auto          # auto | usb | semfio | vnc | lan | status | setupvnc
+PROFILE=qualidade
+DESKTOP=0
+EXTRA=()
+TRIES_SET=${S10_WAIT_TRIES:-}
+
+die() { echo "s10: $*" >&2; exit 1; }
+info() { echo "s10: $*" >&2; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+    status) MODE=status ;;
+    setup-vnc) MODE=setupvnc ;;
+    --usb) MODE=usb ;;
+    --sem-fio) MODE=semfio ;;
+    --vnc) MODE=vnc ;;
+    --lan) MODE=lan ;;
+    --rapido) PROFILE=rapido ;;
+    --desktop) DESKTOP=1 ;;
+    --audio) AUDIO=1 ;;
+    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --) shift; EXTRA=("$@"); break ;;
+    *) die "opção desconhecida: $1 (use --help)" ;;
+    esac
+    shift
+done
+
+TUN=
+VTUN=
+# shellcheck disable=SC2329  # called via trap
+cleanup() {
+    stop_tunnel
+    if [ -n "$VTUN" ]; then kill "$VTUN" 2>/dev/null; wait "$VTUN" 2>/dev/null; fi
+    if [ -n "$PWTMP" ]; then rm -f "$PWTMP"; fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+stop_tunnel() {
+    if [ -n "$TUN" ]; then kill "$TUN" 2>/dev/null; wait "$TUN" 2>/dev/null; fi
+    TUN=
+    unset ADB_SERVER_SOCKET
+}
+
+now_ms() { echo $(($(date +%s%N) / 1000000)); }
+
+# ssh sem interação, com prazo curto: falha rápido se o destino estiver fora do ar
+ssh_quick() { timeout $((CT + 3)) ssh ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} -o BatchMode=yes -o ConnectTimeout="$CT" -o ClearAllForwardings=yes \
+    -o ControlMaster=no -o ControlPath=none -o ControlPersist=no "$@"; }
+
+# tcp_ok <host> <porta>: conecta em até CT s (bash /dev/tcp)
+# shellcheck disable=SC2016  # $0/$1 are for the inner bash
+tcp_ok() { timeout "$CT" bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2" 2>/dev/null; }
+
+# json_get '<json>' a.b.c : imprime o valor (vazio se não houver)
+json_get() {
+    python3 -I -c '
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except ValueError:
+    sys.exit(0)
+for k in sys.argv[2].split("."):
+    d = d.get(k) if isinstance(d, dict) else None
+print("" if d is None else str(d).lower() if isinstance(d, bool) else d)' "$1" "$2" 2>/dev/null
+}
+
+# Escolhe o serial entre as linhas "device" de `adb devices`; $1 = saída do adb.
+pick_serial() {
+    local devs n
+    devs=$(printf '%s\n' "$1" | awk -F'\t' 'NF>=2 && $2=="device" {print $1}')
+    if [ -n "$SERIAL" ]; then
+        printf '%s\n' "$devs" | grep -qxF "$SERIAL" && echo "$SERIAL"
+        return
+    fi
+    if [ "$MODE" = lan ]; then
+        devs=$(printf '%s\n' "$devs" | grep -E ':[0-9]+$|_adb-tls-connect')
+    fi
+    n=$(printf '%s' "$devs" | grep -c .)
+    [ "$n" -eq 1 ] && printf '%s\n' "$devs"
+}
+
+# ------------------------------------------------------------------ scrcpy
+SERIAL_USED=
+PATH_ARGS=()       # argumentos específicos do caminho (USB: --force-adb-forward, --no-audio)
+run_scrcpy_flow() {
+    local args=(-s "$SERIAL_USED" --turn-screen-off --stay-awake --window-title=S10) codec=$CODEC start rc
+    args+=("${PATH_ARGS[@]}")
+    if [ "$PROFILE" = rapido ]; then
+        args+=(--max-size=1024 --video-bit-rate=4M)
+        codec=h264
+    else
+        args+=(--max-size=1440 --video-bit-rate=8M --max-fps=60)
+    fi
+    if [ "$DESKTOP" -eq 1 ]; then
+        # modo desktop do AOSP no display virtual (1ª vez pode exigir reinício do celular)
+        adb -s "$SERIAL_USED" shell settings put global force_desktop_mode_on_external_displays 1 >/dev/null 2>&1
+        adb -s "$SERIAL_USED" shell settings put global enable_freeform_support 1 >/dev/null 2>&1
+        args+=(--new-display=1920x1080/160)
+    fi
+    start=$SECONDS
+    scrcpy "${args[@]}" --video-codec="$codec" "${EXTRA[@]}"
+    rc=$?
+    if [ "$rc" -ne 0 ] && [ "$codec" != h264 ] && [ $((SECONDS - start)) -lt 10 ]; then
+        info "$codec recusado pelo aparelho, tentando h264..."
+        scrcpy "${args[@]}" --video-codec=h264 "${EXTRA[@]}"
+        rc=$?
+    fi
+    SCRCPY_SECS=$((SECONDS - start))
+    return "$rc"
+}
+
+# ------------------------------------------------------------------ caminho 1: USB via atheron
+R_USB=
+start_usb_tunnel() {
+    # Um único ssh: o socket unix do adb do atheron vira um socket local 0700 (nada de TCP 5037) e o vídeo
+    # do scrcpy (--force-adb-forward) vai por 127.0.0.1:27183. StreamLocalBindUnlink apaga socket velho.
+    ssh -CN ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} \
+        -o ControlMaster=no -o ControlPath=none -o ControlPersist=no \
+        -o ExitOnForwardFailure=yes -o BatchMode=yes -o ConnectTimeout="$CT" \
+        -o StreamLocalBindUnlink=yes \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+        -L "${LSOCK}:${ADB_REMOTE_SOCK}" -L "127.0.0.1:${SCRPORT}:127.0.0.1:${SCRPORT}" \
+        "$HOST" &
+    TUN=$!
+}
+
+# Espera o socket local do túnel existir (máx ~5 s) antes de qualquer chamada ao adb: sem servidor ali,
+# o cliente adb subiria um servidor LOCAL nesse caminho.
+wait_tunnel_port() {
+    local i
+    for ((i = 0; i < 25; i++)); do
+        kill -0 "$TUN" 2>/dev/null || return 1
+        [ -S "$LSOCK" ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
+try_usb() {
+    local tries=${TRIES_SET:-$([ "$MODE" = auto ] && echo 6 || echo 20)} i out state where hint up=0
+    [ -d "$RUNDIR" ] || { mkdir -p "$RUNDIR" 2>/dev/null && chmod 700 "$RUNDIR"; }
+    for _ in 1 2; do
+        rm -f "$LSOCK"
+        start_usb_tunnel
+        if wait_tunnel_port; then up=1; break; fi
+        stop_tunnel
+    done
+    if [ "$up" -ne 1 ]; then
+        R_USB="o túnel SSH para $HOST não subiu (atheron fora do ar, chave SSH não autorizada para o usuário do túnel, ou $LSOCK ocupado). Confira: ssh $HOST."
+        return 1
+    fi
+    export ADB_SERVER_SOCKET="localfilesystem:${LSOCK}"
+    # Espera o adb (do atheron, via túnel) responder e achar o aparelho.
+    out=
+    for ((i = 0; i < tries; i++)); do
+        if ! kill -0 "$TUN" 2>/dev/null; then
+            TUN=
+            R_USB="o túnel SSH para $HOST caiu (atheron fora do ar?). Confira a rede/Tailscale e a chave SSH (ssh $HOST)."
+            stop_tunnel
+            return 1
+        fi
+        out=$(adb devices 2>/dev/null) && [ -n "$(printf '%s\n' "$out" | awk -F'\t' 'NF>=2')" ] && break
+        sleep 0.5
+    done
+    local saved=$SERIAL
+    if [ -z "$SERIAL" ] && printf '%s\n' "$out" | awk -F'\t' '$2=="device" {print $1}' | grep -qxF "$DEFAULT_SERIAL"; then
+        SERIAL=$DEFAULT_SERIAL
+    fi
+    if ! SERIAL_USED=$(pick_serial "$out") || [ -z "$SERIAL_USED" ]; then
+        SERIAL=$saved
+        where="O atheron ($HOST) não enxerga o S10"
+        hint="No atheron: bash user-step-s10.sh --check; confira o cabo USB e o 'Depuração USB'."
+        state=$(printf '%s\n' "$out" | awk -F'\t' 'NF>=2 && $2!="device" {print $1" ("$2")"}' | paste -sd, -)
+        [ -n "$state" ] && where="$where; estado visto: $state (unauthorized = aceite a chave RSA na tela do S10)"
+        R_USB="$where. $hint Se houver mais de um aparelho, defina S10_SERIAL."
+        stop_tunnel
+        return 1
+    fi
+    SERIAL=$saved
+    PATH_ARGS=(--force-adb-forward)
+    [ "$AUDIO" -eq 1 ] || PATH_ARGS+=(--no-audio)
+    return 0
+}
+
+# ------------------------------------------------------------------ caminho 2: adb sem fio
+R_AW=
+ATHERON_STATE=
+fetch_atheron_state() {
+    [ -n "$ATHERON_STATE" ] && return 0
+    ATHERON_STATE=$(ssh_quick "$HOST" "cat $STATE_REMOTE" 2>/dev/null) || ATHERON_STATE=
+    [ -n "$ATHERON_STATE" ]
+}
+
+cache_get() { # cache_get <chave>
+    [ -f "$CACHE" ] || return 0
+    json_get "$(cat "$CACHE" 2>/dev/null)" "$1"
+}
+cache_put() { # cache_put <ip> <porta>
+    local tmp
+    mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
+    tmp=$(mktemp "$CACHE_DIR/.estado.XXXXXX" 2>/dev/null) || return 0
+    if printf '{"ip":"%s","porta":%s}\n' "$1" "$2" > "$tmp"; then mv -f "$tmp" "$CACHE"; else rm -f "$tmp"; fi
+}
+
+# Candidatos ip:porta por mDNS: `adb mdns services` e, se faltar, avahi-browse.
+mdns_candidates() {
+    timeout 5 adb mdns services 2>/dev/null |
+        awk -F'\t' '$2 ~ /_adb-tls-connect/ {print $3}' | grep -E '^[0-9.]+:[0-9]+$'
+    if command -v avahi-browse >/dev/null 2>&1; then
+        timeout 5 avahi-browse -rtp _adb-tls-connect._tcp 2>/dev/null |
+            awk -F';' '$1=="=" && $3=="IPv4" {print $8 ":" $9}'
+    fi
+}
+
+# tenta `adb connect` em ip:porta com prazo; define SERIAL_USED em caso de sucesso
+try_connect() {
+    local cand=$1 out
+    info "adb connect $cand ..."
+    out=$(timeout $((CT + 2)) adb connect "$cand" 2>&1)
+    if printf '%s' "$out" | grep -qiE '^(already )?connected to'; then
+        SERIAL_USED=$cand
+        cache_put "${cand%:*}" "${cand##*:}"
+        return 0
+    fi
+    LAST_ERR=$out
+    return 1
+}
+
+try_semfio() {
+    local ip tip port cands c cport
+    R_AW=
+    LAST_ERR=
+    PATH_ARGS=()
+    unset ADB_SERVER_SOCKET
+    # 1) porta publicada pelo guardião do atheron (mDNS na LAN dele): conecta pela TAILNET primeiro
+    #    (o adbd escuta em todas as interfaces, então funciona fora de casa), depois pelo IP da LAN
+    if fetch_atheron_state; then
+        port=$(json_get "$ATHERON_STATE" caminhos.adb_sem_fio.porta)
+        ip=$(json_get "$ATHERON_STATE" caminhos.adb_sem_fio.ip_lan)
+        [ -n "$ip" ] || ip=$(json_get "$ATHERON_STATE" caminhos.adb_sem_fio.ip)
+        tip=$(json_get "$ATHERON_STATE" caminhos.adb_sem_fio.ip_tailnet)
+        tip=${tip:-$TAILNET_IP}
+        if [ -n "$port" ]; then
+            try_connect "$tip:$port" && return 0
+            [ -n "$ip" ] && { try_connect "$ip:$port" && return 0; }
+        else
+            R_AW="o atheron não publicou a porta (depuração sem fio desligada ou fora do mDNS do atheron?)"
+        fi
+    else
+        R_AW="atheron inacessível"
+    fi
+    # 2) cache: IP da tailnet + última porta conhecida (o IP da LAN muda por DHCP: nunca é reaproveitado)
+    cport=$(cache_get porta)
+    if [ -n "$cport" ] && [ "${cport}" != "${port:-}" ]; then
+        try_connect "$TAILNET_IP:$cport" && return 0
+    elif [ -z "$cport" ]; then
+        R_AW="${R_AW:+$R_AW; }sem porta no cache (~/.cache/s10/estado.json)"
+    fi
+    # 3) mDNS na LAN (só funciona em casa)
+    cands=$(mdns_candidates | sort -u)
+    for c in $cands; do try_connect "$c" && return 0; done
+    R_AW="${R_AW:-nenhum IP:porta respondeu}${LAST_ERR:+ (adb: $(printf '%s' "$LAST_ERR" | head -n1))}. A porta muda a cada ativação; o nomad precisa estar com o pareamento feito (README)."
+    return 1
+}
+
+# ------------------------------------------------------------------ caminho 3: VNC pelo Termux
+R_VNC=
+VIEWER_URL=
+try_vnc() {
+    local target h i
+    R_VNC=
+    for h in "$PHONE" "$TAILNET_IP"; do
+        target="${TERMUX_USER:+$TERMUX_USER@}$h"
+        info "túnel SSH para o Termux ($target:$SSH_PORT) ..."
+        ssh -N -p "$SSH_PORT" ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} \
+            -o ControlMaster=no -o ControlPath=none -o ControlPersist=no \
+            -o ExitOnForwardFailure=yes -o BatchMode=yes -o ConnectTimeout="$CT" \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            -L "127.0.0.1:${VNC_LPORT}:127.0.0.1:${VNC_RPORT}" "$target" &
+        VTUN=$!
+        for ((i = 0; i < ((CT + 3) * 5); i++)); do
+            kill -0 "$VTUN" 2>/dev/null || break
+            tcp_ok 127.0.0.1 "$VNC_LPORT" && break
+            sleep 0.2
+        done
+        if kill -0 "$VTUN" 2>/dev/null && tcp_ok 127.0.0.1 "$VNC_LPORT"; then
+            VIEWER_URL="vnc://127.0.0.1:${VNC_LPORT}"
+            return 0
+        fi
+        kill "$VTUN" 2>/dev/null; wait "$VTUN" 2>/dev/null; VTUN=
+        R_VNC="não consegui o túnel SSH até o Termux ($PHONE/$TAILNET_IP:$SSH_PORT): celular fora da tailnet, sshd parado ou chave não autorizada."
+    done
+    return 1
+}
+
+# Senha do VNC (arquivo 0600 do setup-vnc); nunca vai para argv nem para a tela.
+read_vnc_pass() {
+    [ -r "$VNC_PASS_FILE" ] || return 1
+    local perm
+    perm=$(stat -c %a "$VNC_PASS_FILE" 2>/dev/null)
+    [ "$perm" = 600 ] || info "aviso: $VNC_PASS_FILE deveria ser 0600 (está $perm)"
+    IFS= read -r VNC_PASS < "$VNC_PASS_FILE" || [ -n "$VNC_PASS" ]
+    [ -n "$VNC_PASS" ]
+}
+
+run_vnc_viewer() {
+    local VNC_PASS=
+    read_vnc_pass || info "sem senha do VNC em $VNC_PASS_FILE: rode 's10 setup-vnc' (o servidor exige senha)"
+    if command -v vncviewer >/dev/null 2>&1 && command -v vncpasswd >/dev/null 2>&1 && [ -n "$VNC_PASS" ]; then
+        # tigervnc: arquivo de senha ofuscado (vncpasswd -f), 0600, removido ao sair
+        PWTMP=$(mktemp)
+        chmod 600 "$PWTMP"
+        printf '%s\n' "$VNC_PASS" | vncpasswd -f > "$PWTMP"
+        info "abrindo vncviewer 127.0.0.1::$VNC_LPORT"
+        vncviewer -passwd "$PWTMP" "127.0.0.1::$VNC_LPORT"
+    elif command -v krdc >/dev/null 2>&1; then
+        if [ -n "$VNC_PASS" ] && command -v wl-copy >/dev/null 2>&1; then
+            printf '%s' "$VNC_PASS" | wl-copy
+            ( sleep "$CLIP_SECS"; wl-copy --clear ) >/dev/null 2>&1 &
+            info "senha do VNC copiada por ${CLIP_SECS} s (Ctrl+V na janela)"
+        fi
+        info "abrindo krdc $VIEWER_URL"
+        krdc "$VIEWER_URL"
+    elif command -v vncviewer >/dev/null 2>&1; then
+        info "abrindo vncviewer 127.0.0.1:$VNC_LPORT"
+        vncviewer "127.0.0.1:$VNC_LPORT"
+    else
+        info "nenhum cliente VNC (krdc/vncviewer). Túnel ativo; conecte seu cliente em: $VIEWER_URL (Ctrl-C encerra)"
+        wait "$VTUN"
+    fi
+}
+
+setup_vnc() {
+    local dir tmp
+    dir=$(dirname "$VNC_PASS_FILE")
+    ( umask 077; mkdir -p "$dir" )
+    tmp=$(umask 077; mktemp "$dir/.vnc-password.XXXXXX") || die "não consegui criar o arquivo temporário em $dir"
+    # o ssh de manutenção (root no atheron) só lê o arquivo; a senha nunca passa por argv/echo
+    if ! timeout $((CT + 5)) ssh ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} -o BatchMode=yes -o ConnectTimeout="$CT" -o ClearAllForwardings=yes \
+        "$ADMIN_HOST" "cat /etc/cerberus-s10/vnc-password" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        die "não consegui ler a senha em $ADMIN_HOST (/etc/cerberus-s10/vnc-password). Rode o instalador no atheron e confira o SSH de manutenção."
+    fi
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$VNC_PASS_FILE"
+    info "senha do VNC gravada em $VNC_PASS_FILE (0600)."
+}
+
+# ------------------------------------------------------------------ status
+status_cmd() {
+    local t0 t1 ok=0 st ip port est line vnc_ok c h
+    # caminho 1: o estado.json do atheron diz se o S10 está em 'device' no USB
+    t0=$(now_ms)
+    if fetch_atheron_state; then
+        t1=$(now_ms)
+        est=$(json_get "$ATHERON_STATE" estado)
+        if [ "$est" = device ]; then
+            echo "✓ 1) USB via atheron: S10 em 'device' ($((t1 - t0)) ms até o atheron)"; ok=1
+        else
+            echo "✗ 1) USB via atheron: atheron responde ($((t1 - t0)) ms) mas o S10 está '${est:-?}' (cabo? chave RSA?)"
+        fi
+    else
+        echo "✗ 1) USB via atheron: $HOST inacessível por SSH em ${CT}s (rede/Tailscale/chave?)"
+    fi
+    # caminho 2: porta do adb sem fio acessível daqui (IP do atheron, tailnet ou cache)
+    ip=; port=
+    if [ -n "$ATHERON_STATE" ]; then
+        ip=$(json_get "$ATHERON_STATE" caminhos.adb_sem_fio.ip_lan)
+        port=$(json_get "$ATHERON_STATE" caminhos.adb_sem_fio.porta)
+    fi
+    [ -n "$port" ] || port=$(cache_get porta)
+    if [ -z "$port" ]; then
+        # esta versão do One UI não expõe a porta TLS ao shell: descobre por mDNS na LAN
+        c=$(mdns_candidates | head -n1)
+        if [ -n "$c" ]; then ip=${c%:*}; port=${c##*:}; fi
+    fi
+    if [ -z "$port" ]; then
+        echo "✗ 2) adb sem fio: porta desconhecida (sem publicação do atheron, sem mDNS na LAN, sem cache)"
+    else
+        st="✗"; line=
+        for h in "$TAILNET_IP" ${ip:+"$ip"}; do
+            t0=$(now_ms)
+            if tcp_ok "$h" "$port"; then
+                t1=$(now_ms); st="✓"; ok=1
+                line="$h:$port aceita conexão ($((t1 - t0)) ms)"; break
+            fi
+        done
+        [ "$st" = "✓" ] || line="nenhum de $TAILNET_IP${ip:+, $ip} respondeu na porta $port (depuração sem fio desligada ou fora da rede)"
+        echo "$st 2) adb sem fio: $line"
+    fi
+    # caminho 3: sshd do Termux pela tailnet (+ estado do VNC segundo o atheron)
+    t0=$(now_ms)
+    if tcp_ok "$TAILNET_IP" "$SSH_PORT"; then
+        t1=$(now_ms); ok=1
+        vnc_ok=$(json_get "$ATHERON_STATE" caminhos.vnc.ok)
+        case "$vnc_ok" in
+        true) line="servidor VNC ativo no celular (segundo o atheron)" ;;
+        false) line="mas o droidVNC-NG está parado (o guardião deve reiniciá-lo)" ;;
+        *) line="estado do VNC desconhecido (atheron inacessível)" ;;
+        esac
+        echo "✓ 3) VNC via Termux: ssh $TAILNET_IP:$SSH_PORT responde ($((t1 - t0)) ms); $line"
+    else
+        echo "✗ 3) VNC via Termux: $TAILNET_IP:$SSH_PORT não responde em ${CT}s (celular fora da tailnet ou sshd parado)"
+    fi
+    [ "$ok" -eq 1 ]
+}
+
+# ------------------------------------------------------------------ orquestração
+# usa_usb: tenta o caminho 1 e roda o scrcpy. Retorna 0 se rodou bem, 1 se o caminho falhou.
+go_usb() {
+    try_usb || return 1
+    run_scrcpy_flow
+    local rc=$?
+    # no automático, uma falha imediata do scrcpy (<10 s) conta como caminho quebrado
+    if [ "$rc" -ne 0 ] && [ "$MODE" = auto ] && [ "$SCRCPY_SECS" -lt 10 ]; then
+        R_USB="o scrcpy falhou logo ao iniciar pelo atheron (código $rc)"
+        stop_tunnel
+        return 1
+    fi
+    FINAL_RC=$rc
+    return 0
+}
+
+go_semfio() {
+    try_semfio || return 1
+    run_scrcpy_flow
+    local rc=$?
+    if [ "$rc" -ne 0 ] && [ "$MODE" = auto ] && [ "$SCRCPY_SECS" -lt 10 ]; then
+        R_AW="o scrcpy falhou logo ao iniciar por $SERIAL_USED (código $rc)"
+        return 1
+    fi
+    FINAL_RC=$rc
+    return 0
+}
+
+go_vnc() {
+    try_vnc || return 1
+    run_vnc_viewer
+    FINAL_RC=$?
+    return 0
+}
+
+FINAL_RC=0
+case "$MODE" in
+status) status_cmd; exit $? ;;
+setupvnc) setup_vnc; exit 0 ;;
+lan)
+    out=$(adb devices 2>/dev/null)
+    PATH_ARGS=()
+    if ! SERIAL_USED=$(pick_serial "$out") || [ -z "$SERIAL_USED" ]; then
+        die "O adb local não tem o S10 conectado por Wi-Fi. Conecte antes: adb connect <ip>:<porta> (Depuração sem fio > Parear com código). Se houver mais de um aparelho, defina S10_SERIAL."
+    fi
+    run_scrcpy_flow; exit $? ;;
+usb) go_usb || die "$R_USB"; exit "$FINAL_RC" ;;
+semfio) go_semfio || die "caminho sem fio indisponível: $R_AW"; exit "$FINAL_RC" ;;
+vnc) go_vnc || die "$R_VNC"; exit "$FINAL_RC" ;;
+auto)
+    info "caminho 1/3: USB via atheron ($HOST) ..."
+    go_usb && exit "$FINAL_RC"
+    info "caminho 1 falhou: $R_USB"
+    info "caminho 2/3: adb sem fio direto ..."
+    go_semfio && exit "$FINAL_RC"
+    info "caminho 2 falhou: $R_AW"
+    info "caminho 3/3: VNC pelo Termux ..."
+    go_vnc && exit "$FINAL_RC"
+    info "caminho 3 falhou: $R_VNC"
+    die "os três caminhos falharam (rode 's10 status' para o diagnóstico). Se o celular reiniciou, espere uns 2 minutos (Termux:Boot e Tailscale)."
+    ;;
+esac

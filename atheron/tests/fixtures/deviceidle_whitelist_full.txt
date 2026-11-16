@@ -1,0 +1,5 @@
+system,com.android.providers.downloads,10043
+user,com.tailscale.ipn,10311
+user,com.termux,10312
+user,com.termux.boot,10313
+user,net.christianbeier.droidvnc_ng,10314

@@ -1,0 +1,1 @@
+mCurrentFocus=Window{4f2a1c3 u0 com.android.systemui/com.android.systemui.wifi.WifiDebuggingActivity}

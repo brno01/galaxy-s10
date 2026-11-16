@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*.pub
+!termux/authorized_keys.example

@@ -1,0 +1,3 @@
+Wi-Fi is disabled
+Verbose logging is off
+mWifiInfo SSID: <unknown ssid>, BSSID: <none>, MAC: 02:00:00:00:00:00, Supplicant state: DISCONNECTED

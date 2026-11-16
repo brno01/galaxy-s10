@@ -1,0 +1,67 @@
+[Unit]
+Description=Cerberus: Galaxy S10 monitor and guardian (adb over USB)
+After=local-fs.target network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cerberus-s10
+Group=cerberus-s10
+ExecStart=/usr/local/sbin/cerberus-s10
+Restart=always
+RestartSec=10
+# adb server (child process) must die with the service
+KillMode=control-group
+
+# adb key lives in the state dir; the adb server listens ONLY on the unix socket below (never TCP, never `adb -a`)
+Environment=HOME=/var/lib/cerberus-s10
+Environment=ADB_VENDOR_KEYS=/var/lib/cerberus-s10/.android
+Environment=S10_STATE=/run/cerberus-s10/estado.json
+# adb server on a unix socket (no TCP :5037); the group cerberus-s10 (tunnel user) may connect
+Environment=S10_ADB_SOCKET=/run/cerberus-s10/adb.sock
+Environment=S10_PINS=/var/lib/cerberus-s10/pins.json
+Environment=S10_HOME_SSID=homenet
+Environment=S10_HOME_BSSID=02:00:00:00:00:ab
+Environment=S10_INTERVAL=30
+# guardian: tailnet ip of the phone (ping + ssh banner probes), see README
+Environment=S10_TAILNET_IP=100.64.0.10
+# optional overrides: S10_SERIAL, S10_TEMP_MAX, S10_FULL_HOURS, S10_ADB, S10_INTERVAL, S10_TAILNET_IP,
+# S10_TS_PROBE (ping|off), S10_HOME_SSID, S10_SSH_PORT, S10_VNC_PORT, S10_VNC_IFACE, S10_REPAIR=0 (observe only), S10_COOLDOWN
+EnvironmentFile=-/etc/default/cerberus-s10
+# droidVNC-NG access key: root-only file, exposed to the service (non-root) as $CREDENTIALS_DIRECTORY/vnc-access-key
+LoadCredential=vnc-access-key:/etc/cerberus-s10/vnc-access-key
+LoadCredential=vnc-password:/etc/cerberus-s10/vnc-password
+StateDirectory=cerberus-s10
+StateDirectoryMode=0700
+RuntimeDirectory=cerberus-s10
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=no
+UMask=0007
+
+NoNewPrivileges=yes
+ProtectProc=invisible
+ProcSubset=pid
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# USB device nodes only (char major 189); no PrivateDevices, adb needs /dev/bus/usb
+DevicePolicy=closed
+DeviceAllow=char-usb_device rw
+
+[Install]
+WantedBy=multi-user.target

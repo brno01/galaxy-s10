@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=Galaxy S10
+Comment=Controla o Galaxy S10 do homelab (scrcpy via atheron)
+Exec=s10
+Terminal=true
+Icon=smartphone
+Categories=Utility;
+Actions=rapido;desktop;lan;
+
+[Desktop Action rapido]
+Name=Modo rápido
+Exec=s10 --rapido
+
+[Desktop Action desktop]
+Name=Modo desktop (1920x1080)
+Exec=s10 --desktop
+
+[Desktop Action lan]
+Name=Direto pela LAN
+Exec=s10 --lan
