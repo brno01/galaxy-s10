@@ -55,7 +55,7 @@ for opt in ProtectProc=invisible ProcSubset=pid MemoryDenyWriteExecute=yes Syste
     ok "unit: $opt" "grep -q '$opt' '$HERE/../cerberus-s10.service'"
 done
 ok "unit: tailscaled ordering" "grep -q '^After=.*network-online.target tailscaled.service' '$HERE/../cerberus-s10.service'"
-ok "unit: public dir writable (ReadWritePaths)" "grep -qx 'ReadWritePaths=/run/cerberus-s10-publico' '$HERE/../cerberus-s10.service'"
+ok "unit: public dir writable, optional (dash prefix)" "grep -qx 'ReadWritePaths=-/run/cerberus-s10-publico' '$HERE/../cerberus-s10.service' && grep -qx 'ProtectSystem=strict' '$HERE/../cerberus-s10.service' && grep -qx 'UMask=0007' '$HERE/../cerberus-s10.service'"
 ok "unit: no Environment for the public path (default in code)" "! grep -q S10_PUBLIC '$HERE/../cerberus-s10.service'"
 ok "tmpfiles: public dir 0755 cerberus-s10" "grep -qx 'd /run/cerberus-s10-publico 0755 cerberus-s10 cerberus-s10 -' '$HERE/../cerberus-s10-publico.tmpfiles'"
 ok "installer installs and removes the tmpfiles" "grep -q 'tmpfiles.d/cerberus-s10-publico.conf' '$HERE/../user-step-s10.sh' && grep -q 'systemd-tmpfiles --create' '$HERE/../user-step-s10.sh'"

@@ -197,6 +197,24 @@ class PublicSummary(unittest.TestCase):
         self.assertEqual(m.public_summary(s, a, 1000)["avisos"], [])
 
 
+class PublicSummaryIsolation(unittest.TestCase):
+    def test_unwritable_public_path_does_not_stop_estado(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            fake_adb = os.path.join(d, "adb")
+            with open(fake_adb, "w") as f:
+                f.write("#!/bin/sh\nexit 1\n")
+            os.chmod(fake_adb, 0o755)
+            estado = os.path.join(d, "estado.json")
+            env = {"S10_ADB": fake_adb, "S10_STATE": estado, "S10_ADB_SOCKET": "",
+                   "S10_PUBLIC": os.path.join(d, "missing-dir", "resumo.json")}
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual(m.main(["--once"]), 0)
+            with open(estado) as f:
+                self.assertEqual(json.load(f)["estado"], "ausente")
+            self.assertFalse(os.path.exists(env["S10_PUBLIC"]))
+
+
 class AlertsTest(unittest.TestCase):
     def test_temperature_warns_once_then_repeats_hourly(self):
         a = m.Alerts()
