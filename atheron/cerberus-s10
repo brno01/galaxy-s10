@@ -1085,6 +1085,31 @@ class Guardian:
         return lines
 
 
+def public_summary(snap, alerts, now):
+    """Whitelisted summary for dashboards (the private estado.json holds IPs, ports and the serial).
+    Built field by field: never copy or filter the full snapshot."""
+    bat = snap.get("bateria")
+    bateria = None
+    if bat:
+        bateria = {"nivel": bat.get("nivel"), "status": bat.get("status"),
+                   "temperatura_c": bat.get("temperatura_c"), "saude": bat.get("saude")}
+    caminhos = snap.get("caminhos") or {}
+    paths = {}
+    for name in ("usb", "adb_sem_fio", "tailscale", "ssh_termux", "vnc"):
+        entry = caminhos.get(name)
+        ok = entry.get("ok") if isinstance(entry, dict) else None
+        paths[name] = ok if isinstance(ok, bool) else None
+    avisos = []
+    if bat:
+        t = bat.get("temperatura_c")
+        if t is not None and t >= alerts.temp_max:
+            avisos.append("temperatura")
+        if (bat.get("nivel") or 0) >= 100 and alerts.full_since is not None \
+                and now - alerts.full_since >= alerts.full_s:
+            avisos.append("carga_cheia")
+    return {"versao": 1, "gerado_em": int(now), "bateria": bateria, "caminhos": paths, "avisos": avisos}
+
+
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
@@ -1097,6 +1122,7 @@ def main(argv=None):
     interval = float(env.get("S10_INTERVAL", "30"))
     path = env.get("S10_STATE", "/run/cerberus-s10/estado.json")
     alerts = Alerts(float(env.get("S10_TEMP_MAX", "45")), float(env.get("S10_FULL_HOURS", "24")))
+    public_path = env.get("S10_PUBLIC", "/run/cerberus-s10-publico/resumo.json")
     sock = env.get("S10_ADB_SOCKET", "/run/cerberus-s10/adb.sock")
     server_args = ["-L", "localfilesystem:" + sock] if sock else []
     if sock:
@@ -1128,6 +1154,10 @@ def main(argv=None):
             except Exception as e:  # a guardian bug must not stop the estado.json
                 log("guardian error: %r" % (e,))
             write_atomic(path, snap, 0o640)
+            try:
+                write_atomic(public_path, public_summary(snap, alerts, snap["epoch"]), 0o644)
+            except Exception as e:  # the public summary must never stop the estado.json
+                log("public summary error: %r" % (e,))
             for m in alerts.evaluate(snap, snap["epoch"]):
                 log("WARNING " + m)
         except Exception as e:  # keep the loop alive; systemd Restart is the backstop

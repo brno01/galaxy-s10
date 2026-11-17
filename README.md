@@ -170,6 +170,17 @@ O serviço escreve `/run/cerberus-s10/estado.json` a cada 30 s (`S10_INTERVAL`):
 
 `estado` é `device`, `unauthorized`, `offline` ou `ausente`. O guardião acrescenta `caminhos` e `guardiao` (últimos reparos). Avisos no journald (`journalctl -u cerberus-s10`): temperatura >= 45 °C, `unauthorized`/ausente (repete a cada hora) e bateria em 100% por mais de 24 h (proteção provavelmente desligada). Ajustes em `/etc/default/cerberus-s10` (`S10_SERIAL`, `S10_TEMP_MAX`, `S10_FULL_HOURS`).
 
+**Resumo público** (`/run/cerberus-s10-publico/resumo.json`, 0644, diretório 0755 criado por `tmpfiles.d`): o `estado.json` é privado (IPs, portas, serial; o diretório dá acesso ao socket do adb). Para painéis rodando sem privilégio (por exemplo o do Kindle, como `nobody`), o serviço publica à parte um resumo montado campo a campo a partir de uma lista permitida, nunca copiando o estado completo:
+
+```json
+{"versao":1,"gerado_em":1763294400,
+ "bateria":{"nivel":87,"status":"charging","temperatura_c":31.2,"saude":"good"},
+ "caminhos":{"usb":true,"adb_sem_fio":false,"tailscale":true,"ssh_termux":true,"vnc":null},
+ "avisos":["temperatura"]}
+```
+
+`bateria` é `null` sem celular; cada caminho é `true`/`false` ou `null` (desconhecido); `avisos` usa os códigos `temperatura` (>= `S10_TEMP_MAX`) e `carga_cheia` (100% por mais de `S10_FULL_HOURS`). Não há IP, porta, serial, SSID nem dados do guardião. O caminho padrão está no código (`S10_PUBLIC` só para testes); se a escrita falhar, só vai para o log e o `estado.json` segue.
+
 Confirme que o adb não tem listener TCP (o `--check` do instalador também confere):
 
 ```
