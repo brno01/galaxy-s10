@@ -39,6 +39,9 @@ import os, socket, sys, time
 try: os.unlink(sys.argv[1])
 except OSError: pass
 s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(5); time.sleep(30)' "$sock" ;;
+*" acordar-atheron")
+    [ -n "${FAKE_PHONE_DOWN:-}" ] && { echo "ssh: connect to host: Connection timed out" >&2; exit 255; }
+    echo "pacote mágico enviado para 02:00:00:00:00:aa via 192.0.2.255 (12 envios)"; exit 0 ;;
 esac
 exit 0
 F
@@ -255,6 +258,7 @@ expect_rc "auto/vnc: exit 0" eq 0
 reset_env
 FAKE_ATHERON_DOWN=1 S10_TERMUX_USER=u0_a345 run --vnc
 check "vnc: user@host" 'ssh -N -p 8022 .* u0_a345@celular-test'
+check "vnc: host key checked by the phone name (IP fallback without MagicDNS)" 'ssh -N -p 8022 .*HostKeyAlias=\[celular-test\]:8022'
 S10_TERMUX_USER=u0_a345 FAKE_PHONE_DOWN=1 run --vnc
 expect_rc "vnc: phone down fails" eq 1
 check "vnc: tried name then tailnet ip" 'u0_a345@100\.64\.0\.9'
@@ -383,6 +387,28 @@ check "status: wireless unknown port" '✗ 2\) adb sem fio: porta desconhecida' 
 check "status: ssh down reason" '✗ 3\) VNC via Termux.*não responde' "$TMP/out"
 FAKE_STATE='{"estado":"unauthorized"}' S10_SSH_PORT=1 run status
 check "status: S10 not device" "✗ 1\) .*'unauthorized'" "$TMP/out"
+
+# ---------------------------------------------------------------- acordar-atheron
+reset_env
+S10_WAKE_WAIT=0 S10_TERMUX_USER=u0_a345 run acordar-atheron
+expect_rc "wake: exits 0 without waiting" eq 0
+check "wake: asks the Termux directly (port 8022, phone name)" 'ssh .*BatchMode=yes.* -p 8022 .*u0_a345@celular-test acordar-atheron'
+refute "wake: never goes through the atheron" 'atheron-test'
+check "wake: reports the packet" 'pacote mágico enviado' "$TMP/err"
+FAKE_PHONE_DOWN=1 S10_WAKE_WAIT=0 run acordar-atheron
+expect_rc "wake: phone down fails" ne 0
+check "wake: falls back to the tailnet IP" '-p 8022 .*([^ ]*@)?100\.64\.0\.9 acordar-atheron'
+check "wake: IP fallback checks the phone's host key by name" 'HostKeyAlias=\[celular-test\]:8022 .*100\.64\.0\.9 acordar-atheron'
+check "wake: phone down reason" 'não consegui pelo Termux' "$TMP/err"
+S10_ATHERON_ADDR=127.0.0.1 S10_ATHERON_PORT=$LPORT_OK run acordar-atheron
+expect_rc "wake: waits until the atheron answers" eq 0
+check "wake: answer time printed" 'atheron respondeu em [0-9]+s' "$TMP/out"
+S10_ATHERON_ADDR=127.0.0.1 S10_ATHERON_PORT=1 S10_WAKE_WAIT=1 run acordar-atheron
+expect_rc "wake: timeout fails" ne 0
+check "wake: timeout reason" 'não respondeu em 1s' "$TMP/err"
+run --help
+check "help lists acordar-atheron" 'acordar-atheron' "$TMP/out"
+refute "help prints only the comment block" '^ADMIN_HOST|^set -u' "$TMP/out"
 
 run --nada
 expect_rc "unknown option rejected" ne 0

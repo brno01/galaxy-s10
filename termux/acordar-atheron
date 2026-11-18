@@ -1,0 +1,53 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# acordar-atheron: manda o pacote mágico de Wake-on-LAN para o cabo do atheron (o S10 está na mesma LAN).
+# Uso: acordar-atheron [MAC] [BROADCAST]      (padrões: ATHERON_MAC / ATHERON_BCAST ou os valores abaixo)
+#      acordar-atheron --dump [MAC]           (escreve o pacote em stdout, sem enviar: para testes)
+# Envia 3 vezes para o broadcast da LAN e para 255.255.255.255, portas 9 e 7 (UDP; não precisa de root).
+# Requer: pkg install socat
+set -eu
+
+DEFAULT_MAC=02:00:00:00:00:aa      # enp2s0f1 do atheron
+DEFAULT_BCAST=192.0.2.255
+
+DUMP=0
+if [ "${1:-}" = "--dump" ]; then DUMP=1; shift; fi
+MAC=${1:-${ATHERON_MAC:-$DEFAULT_MAC}}
+BCAST=${2:-${ATHERON_BCAST:-$DEFAULT_BCAST}}
+
+HEX=$(printf '%s' "$MAC" | tr -d ':-' | tr 'A-F' 'a-f')
+case "$HEX" in
+*[!0-9a-f]*) echo "MAC inválido: $MAC" >&2; exit 2 ;;
+esac
+[ ${#HEX} -eq 12 ] || { echo "MAC inválido: $MAC" >&2; exit 2; }
+
+# octal escapes (dash's printf has no \x): 6 x 0xff + 16 x MAC = 102 bytes
+MACOCT=
+rest=$HEX
+while [ -n "$rest" ]; do
+    byte=${rest%"${rest#??}"}
+    rest=${rest#??}
+    MACOCT="$MACOCT$(printf '\\%03o' "0x$byte")"
+done
+PKT='\377\377\377\377\377\377'
+i=0
+while [ $i -lt 16 ]; do PKT="$PKT$MACOCT"; i=$((i + 1)); done
+
+if [ "$DUMP" -eq 1 ]; then
+    # shellcheck disable=SC2059  # the format IS the packet (octal escapes)
+    printf "$PKT"
+    exit 0
+fi
+
+command -v socat >/dev/null 2>&1 || { echo "socat ausente: pkg install socat" >&2; exit 1; }
+sent=0
+for round in 1 2 3; do
+    for dst in "$BCAST" 255.255.255.255; do
+        for port in 9 7; do
+            # shellcheck disable=SC2059
+            printf "$PKT" | socat -u - "UDP-DATAGRAM:$dst:$port,broadcast" 2>/dev/null && sent=$((sent + 1))
+        done
+    done
+    [ "$round" -lt 3 ] && sleep 1
+done
+[ "$sent" -gt 0 ] || { echo "nenhum pacote saiu (Wi-Fi desligado?)" >&2; exit 1; }
+echo "pacote mágico enviado para $MAC via $BCAST ($sent envios)"

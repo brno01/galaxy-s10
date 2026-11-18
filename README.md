@@ -210,6 +210,45 @@ s10 -- --record=s10.mkv    # argumentos extras vão ao scrcpy
 
 Sempre: `--turn-screen-off --stay-awake`; áudio desligado no caminho USB (`--audio` liga). Variáveis: `S10_TUNNEL` (padrão `s10tunnel@atheron`: usuário restrito do túnel e do estado), `S10_ATHERON` (padrão `root@atheron`, só manutenção/`setup-vnc`; se definido sem `S10_TUNNEL`, também serve ao túnel), `S10_SERIAL`, `S10_PHONE` (galaxy-s10), `S10_TAILNET_IP`, `S10_TERMUX_USER` (usuário do Termux para o `--vnc`), `S10_VNC_LPORT` (5901). O caminho 2 pega IP/porta do `estado.json` do atheron, senão mDNS (`adb mdns services`/`avahi-browse`), senão o IP da tailnet com a última porta em `~/.cache/s10/estado.json`. O túnel segue a doc do scrcpy ("Remote ADB server"): `ssh -CN -L5038:localhost:5037 -R27183:localhost:27183`, com `ADB_SERVER_SOCKET=tcp:localhost:5038`; ao sair, o túnel é derrubado. Se o atheron não enxergar o S10 o script explica em português (cabo, `--check`, chave RSA).
 
+## Ligar o atheron pelo S10 (Wake-on-LAN)
+
+O S10 fica na mesma LAN do atheron (Wi-Fi `homenet`) e tem tailnet própria, então continua alcançável com o atheron
+parado. `s10 acordar-atheron` (nomad) entra por SSH direto no Termux (nunca pelo atheron), roda `acordar-atheron`
+(pacote mágico por `socat`, 3 rodadas para `192.0.2.255` e `255.255.255.255`, portas 9 e 7) e espera a porta 22
+do atheron na tailnet (`S10_WAKE_WAIT`, padrão 180 s; `S10_ATHERON_ADDR`, padrão `100.64.0.1`).
+
+```
+# atheron (root), uma vez: ethtool + regra udev 81-cerberus-wol.rules (WoL "g" no enp2s0f1 a cada boot/hotplug)
+ssh root@atheron 'cat > /usr/local/sbin/cerberus-wol && chmod 755 /usr/local/sbin/cerberus-wol && cerberus-wol' < atheron/wol-atheron.sh
+ssh root@atheron cerberus-wol --check          # --undo desfaz
+# Termux: o bootstrap.sh já instala socat e o acordar-atheron; à mão:
+ssh -p 8022 u0_a999@galaxy-s10 'cat > $PREFIX/bin/acordar-atheron && chmod 700 $PREFIX/bin/acordar-atheron' < termux/acordar-atheron
+# nomad
+s10 acordar-atheron
+```
+
+Só funciona pelo cabo (`enp2s0f1`, MAC `02:00:00:00:00:aa`); o `/etc/network/interfaces` é gerado pelo cerberus-ia/net,
+por isso o WoL fica numa regra udev e não lá. Validado em 17/11/2026: os 12 pacotes chegam no cabo como broadcast
+(captura AF_PACKET) e, **a partir da suspensão (deep/S3)**, o atheron voltou 5 s depois do pacote (`suspend entry`
+22:23:23, `exit` 22:23:50; alarme RTC de segurança em +5 min). Em 18/11/2026, **a partir de desligado (S5,
+`systemctl poweroff`)**: o boot anterior terminou 00:00:54, o pacote saiu ~00:01:27 e o boot novo começou 00:01:48;
+`s10 acordar-atheron` levou 42 s até a porta 22 responder (alarme RTC em +6 min, então foi o WoL). Isso apesar de
+o `/proc/acpi/wakeup` declarar só S4 para a `RP09` (porta da placa). O BIOS (Insyde V1.16) trava no `_` ao entrar
+com F2, então não há como conferir a opção por lá; não precisa.
+
+**Automático na volta da energia.** O vigia do Termux (`20-guardian.sh`, a cada 60 s) guarda se o `wlan0` tem IP
+da LAN de casa (`192.168.1.x`) em `~/.guardian-wifi`. Na transição caído → conectado (o AP voltou, logo a energia
+voltou), se o atheron não responde ao ping (`192.0.2.10`/`.57`), roda `acordar-atheron` a cada 30 s, até 10 vezes,
+e para quando ele responde. Pacote para máquina ligada não faz nada, então repetir é inofensivo. O reinício do vigia
+não dispara (o estado fica em arquivo). Log em `~/guardian.log` (`auto-wake: ...`, `home Wi-Fi lost/back`).
+Desligar antes de uma manutenção com o atheron desligado de propósito: `touch ~/.acordar-atheron.off` no Termux
+(apagar o arquivo religa). Variáveis `GUARDIAN_WAKE_*`, `GUARDIAN_ATHERON_IPS`.
+
+Limites: só depois de um desligamento **limpo** pelo Linux (é o driver r8169 que deixa a placa armada; o
+`cerberus-power-guard` desliga assim na falta de energia). Desligado à força (botão segurado) ou com a bateria
+esgotada, o WoL provavelmente não arma: aí só o botão. O automático também depende de o S10 sobreviver à queda: com
+o atheron desligado a USB pode parar de alimentá-lo, e o wake lock gasta a bateria; se o S10 apagar, nada dispara.
+
 ## Recuperação
 
 | Sintoma | O que fazer |

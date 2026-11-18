@@ -16,7 +16,9 @@ Python 3 só stdlib (atheron = Debian, python3.13), bash, sh do Termux. Sem gere
 | Testes do Termux | `bash termux/tests/test_termux.sh` |
 | Testes do instalador | `bash atheron/tests/test_installer.sh` |
 | Testes do wrapper `s10` | `bash nomad/tests/test_s10.sh` |
-| Lint | `shellcheck atheron/user-step-s10.sh nomad/s10 nomad/tests/test_s10.sh termux/tests/test_termux.sh atheron/tests/test_installer.sh && shellcheck -s sh termux/bootstrap.sh termux/boot/*.sh` |
+| Testes do Wake-on-LAN | `bash atheron/tests/test_wol.sh` |
+| Lint | `shellcheck atheron/user-step-s10.sh atheron/wol-atheron.sh atheron/tests/test_wol.sh nomad/s10 nomad/tests/test_s10.sh termux/tests/test_termux.sh atheron/tests/test_installer.sh && shellcheck -s sh termux/bootstrap.sh termux/boot/*.sh termux/acordar-atheron` |
+| Wake-on-LAN no atheron (root) | `/usr/local/sbin/cerberus-wol` (cópia de `atheron/wol-atheron.sh`; `--check`, `--undo`) |
 | Instalar no atheron (USUÁRIO) | `bash atheron/user-step-s10.sh` (`--check`, `--undo`) |
 | Bootstrap do Termux (USUÁRIO) | ver README.md, seção Termux |
 | Instalar o wrapper (nomad) | `install -m755 nomad/s10 ~/.local/bin/s10; install -m644 nomad/s10.desktop ~/.local/share/applications/` |
@@ -25,6 +27,7 @@ Python 3 só stdlib (atheron = Debian, python3.13), bash, sh do Termux. Sem gere
 - `atheron/`: `cerberus-s10` (serviço Python), `cerberus-s10.service`, `51-cerberus-s10.rules`, `user-step-s10.sh`, `tests/` (+ `fixtures/` com saídas reais de dumpsys).
 - `termux/`: `bootstrap.sh` (roda dentro do Termux), `boot/10-sshd.sh`, `boot/20-guardian.sh` (vigia do celular), `tests/`, `authorized_keys.example`.
 - `nomad/`: `s10` (wrapper scrcpy), `s10.desktop`, `tests/test_s10.sh` (ssh/adb/scrcpy falsos no PATH).
+- Wake-on-LAN: `atheron/wol-atheron.sh` (regra udev `81-cerberus-wol.rules`, não mexe em `/etc/network/interfaces`, que é gerado pelo cerberus-ia/net) + `termux/acordar-atheron` (pacote mágico por `socat`, dash sem `\x`) + `s10 acordar-atheron` (fala direto com o Termux, nunca via atheron). Automático no `20-guardian.sh`: Wi-Fi de casa caído → de volta dispara `acordar-atheron` se o atheron não responde (`~/.acordar-atheron.off` desliga). Não dá para simular a queda pelo adb: o `cerberus-s10` religa o Wi-Fi em ≤30 s, antes do ciclo de 60 s do vigia.
 
 - Guardião: `cerberus-s10` repara o celular (read-then-write) e publica `caminhos` em estado.json; segredo do droidVNC-NG só via `LoadCredential` + stdin do `adb shell`, nunca argv/log. Drills em `docs/testes-de-falha.md`.
 
