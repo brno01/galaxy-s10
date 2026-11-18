@@ -4,6 +4,7 @@
 #   (sem args) automático: 1) USB via atheron  2) adb sem fio direto  3) VNC por túnel SSH ao Termux
 #   status     mostra cada caminho (✓/✗), o motivo e a latência de uma sonda rápida
 #   setup-vnc  busca UMA vez a senha do VNC no atheron (ssh admin) e grava em ~/.config/s10/vnc-password (0600)
+#   acordar-atheron  pede ao Termux do S10 (direto pela tailnet) o Wake-on-LAN do atheron e espera ele responder
 #   --usb      só o caminho 1: scrcpy pelo adb do atheron (túnel SSH para o socket unix do adb; sem TCP exposto)
 #   --sem-fio  só o caminho 2: adb connect pela tailnet (porta publicada pelo atheron; LAN/mDNS só como reserva) + scrcpy
 #   --vnc      só o caminho 3: ssh -p 8022 -L 5901:127.0.0.1:5900 até o Termux + cliente VNC
@@ -18,7 +19,8 @@
 #   S10_TAILNET_IP (100.64.0.10), S10_TERMUX_USER (u0_a999),
 #   S10_SSH_PORT (8022), S10_SSH_KEY (~/.ssh/nomad_ed25519, usada se existir),
 #   S10_VNC_PASSWORD_FILE (~/.config/s10/vnc-password), S10_CLIP_SECONDS (30),
-#   S10_VNC_LPORT (5901), S10_VNC_RPORT (5900), S10_CONNECT_TIMEOUT (3), S10_CODEC (h264)
+#   S10_VNC_LPORT (5901), S10_VNC_RPORT (5900), S10_CONNECT_TIMEOUT (3), S10_CODEC (h264),
+#   S10_ATHERON_ADDR (100.64.0.1) / S10_ATHERON_PORT (22) / S10_WAKE_WAIT (180 s; 0 = não espera) do acordar-atheron
 set -u
 
 ADMIN_HOST=${S10_ATHERON:-root@atheron}                    # só manutenção (setup-vnc)
@@ -45,6 +47,9 @@ SSH_PORT=${S10_SSH_PORT:-8022}
 VNC_LPORT=${S10_VNC_LPORT:-5901}
 VNC_RPORT=${S10_VNC_RPORT:-5900}
 CT=${S10_CONNECT_TIMEOUT:-3}
+ATHERON_ADDR=${S10_ATHERON_ADDR:-100.64.0.1}   # IP do atheron na tailnet (não depende do MagicDNS)
+ATHERON_PORT=${S10_ATHERON_PORT:-22}
+WAKE_WAIT=${S10_WAKE_WAIT:-180}
 STATE_REMOTE=/run/cerberus-s10/estado.json
 CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/s10
 CACHE=$CACHE_DIR/estado.json
@@ -61,6 +66,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
     status) MODE=status ;;
     setup-vnc) MODE=setupvnc ;;
+    acordar-atheron) MODE=wake ;;
     --usb) MODE=usb ;;
     --sem-fio) MODE=semfio ;;
     --vnc) MODE=vnc ;;
@@ -68,7 +74,7 @@ while [ $# -gt 0 ]; do
     --rapido) PROFILE=rapido ;;
     --desktop) DESKTOP=1 ;;
     --audio) AUDIO=1 ;;
-    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,/^set -u$/p' "$0" | sed -n 's/^# \{0,1\}//p'; exit 0 ;;
     --) shift; EXTRA=("$@"); break ;;
     *) die "opção desconhecida: $1 (use --help)" ;;
     esac
@@ -97,6 +103,10 @@ now_ms() { echo $(($(date +%s%N) / 1000000)); }
 # ssh sem interação, com prazo curto: falha rápido se o destino estiver fora do ar
 ssh_quick() { timeout $((CT + 3)) ssh ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} -o BatchMode=yes -o ConnectTimeout="$CT" -o ClearAllForwardings=yes \
     -o ControlMaster=no -o ControlPath=none -o ControlPersist=no "$@"; }
+
+# known_hosts guarda o Termux pelo nome ([galaxy-s10]:8022). Sem MagicDNS (p.ex. com o atheron desligado) a queda
+# vai para o IP da tailnet, e a chave tem de ser conferida pelo mesmo nome, senão "Host key verification failed".
+termux_hostkey() { if [ "$SSH_PORT" = 22 ]; then echo "$PHONE"; else echo "[$PHONE]:$SSH_PORT"; fi; }
 
 # tcp_ok <host> <porta>: conecta em até CT s (bash /dev/tcp)
 # shellcheck disable=SC2016  # $0/$1 are for the inner bash
@@ -323,7 +333,7 @@ try_vnc() {
     for h in "$PHONE" "$TAILNET_IP"; do
         target="${TERMUX_USER:+$TERMUX_USER@}$h"
         info "túnel SSH para o Termux ($target:$SSH_PORT) ..."
-        ssh -N -p "$SSH_PORT" ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} \
+        ssh -N -p "$SSH_PORT" ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} -o HostKeyAlias="$(termux_hostkey)" \
             -o ControlMaster=no -o ControlPath=none -o ControlPersist=no \
             -o ExitOnForwardFailure=yes -o BatchMode=yes -o ConnectTimeout="$CT" \
             -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
@@ -395,6 +405,35 @@ setup_vnc() {
     chmod 600 "$tmp"
     mv -f "$tmp" "$VNC_PASS_FILE"
     info "senha do VNC gravada em $VNC_PASS_FILE (0600)."
+}
+
+# ------------------------------------------------------------------ acordar-atheron
+# O S10 fica na mesma LAN do atheron e tem tailnet própria: alcançável mesmo com o atheron desligado.
+wake_atheron() {
+    local h target out='' t0 waited
+    for h in "$PHONE" "$TAILNET_IP"; do
+        target="${TERMUX_USER:+$TERMUX_USER@}$h"
+        info "pedindo ao Termux ($target:$SSH_PORT) o Wake-on-LAN do atheron ..."
+        if out=$(ssh_quick -p "$SSH_PORT" -o HostKeyAlias="$(termux_hostkey)" "$target" acordar-atheron 2>&1); then
+            info "$out"
+            break
+        fi
+        out="falhou: ${out:-sem resposta}"
+    done
+    case "$out" in falhou:*|'') die "não consegui pelo Termux do S10 ($PHONE/$TAILNET_IP:$SSH_PORT): ${out#falhou: }" ;; esac
+    [ "$WAKE_WAIT" -gt 0 ] 2>/dev/null || return 0
+    info "esperando o atheron ($ATHERON_ADDR:$ATHERON_PORT) por até ${WAKE_WAIT}s ..."
+    t0=$(date +%s)
+    while :; do
+        waited=$(($(date +%s) - t0))
+        if tcp_ok "$ATHERON_ADDR" "$ATHERON_PORT"; then
+            echo "atheron respondeu em ${waited}s"
+            return 0
+        fi
+        [ "$waited" -ge "$WAKE_WAIT" ] && break
+        sleep 2
+    done
+    die "o atheron não respondeu em ${WAKE_WAIT}s (desligado de vez sem WoL no BIOS? cabo fora? 's10 acordar-atheron' de novo ou o botão)"
 }
 
 # ------------------------------------------------------------------ status
@@ -495,6 +534,7 @@ FINAL_RC=0
 case "$MODE" in
 status) status_cmd; exit $? ;;
 setupvnc) setup_vnc; exit 0 ;;
+wake) wake_atheron; exit $? ;;
 lan)
     out=$(adb devices 2>/dev/null)
     PATH_ARGS=()

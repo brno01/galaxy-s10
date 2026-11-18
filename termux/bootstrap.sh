@@ -44,7 +44,7 @@ GUARD_SRC=${3:-$(first_file "$SELF/20-guardian.sh" "$SELF/boot/20-guardian.sh")}
 grep -qE '^(ssh-(ed25519|rsa)|ecdsa-sha2-) ' "$KEYS" || { echo "nenhuma chave pública válida em $KEYS"; exit 1; }
 
 pkg update -y
-pkg install -y openssh termux-api termux-services
+pkg install -y openssh termux-api termux-services socat
 
 # sshd: porta 8022, somente chave
 CONF="$PREFIX/etc/ssh/sshd_config"
@@ -90,6 +90,14 @@ chmod 700 "$HOME/.termux/boot/10-sshd.sh"
 # vigia do lado do celular (loop de 60 s: sshd vivo, wake lock, log com rotação)
 cp "$GUARD_SRC" "$HOME/.termux/boot/20-guardian.sh"
 chmod 700 "$HOME/.termux/boot/20-guardian.sh"
+
+# Wake-on-LAN do atheron: 's10 acordar-atheron' (nomad) chama este comando por ssh (socat manda o broadcast)
+WAKE_SRC=$(first_file "$SELF/acordar-atheron")
+if [ -n "$WAKE_SRC" ]; then
+    mkdir -p "$PREFIX/bin"
+    cp "$WAKE_SRC" "$PREFIX/bin/acordar-atheron"
+    chmod 700 "$PREFIX/bin/acordar-atheron"
+fi
 # rede de segurança: ao abrir uma sessão do Termux (o atheron abre o app quando o sshd cai, p.ex. após force-stop),
 # o ~/.bashrc sobe o sshd, o wake lock e o vigia (instância única). Migra o gancho antigo de 2 linhas.
 BRC="$HOME/.bashrc"

@@ -33,6 +33,8 @@ ok "hook takes wake lock" "grep -qx 'termux-wake-lock' '$HOME/.bashrc'"
 ok "hook starts the guardian once" "grep -qF 'pgrep -f 20-guardian.sh >/dev/null ||' '$HOME/.bashrc'"
 ok "sshd Port 8022" "grep -qx 'Port 8022' '$PREFIX/etc/ssh/sshd_config'"
 ok "key authorized" "grep -q 'AAAAC3NzaC1lZDI1NTE5AAAAItest' '$HOME/.ssh/authorized_keys'"
+ok "socat installed (Wake-on-LAN)" "grep -q '^pkg install .*socat' '$LOG_CALLS'"
+ok "acordar-atheron installed 0700" "[ -x '$PREFIX/bin/acordar-atheron' ] && [ \"\$(stat -c %a '$PREFIX/bin/acordar-atheron')\" = 700 ]"
 
 # idempotent + replaces a commented/false property, appends new key without dup
 printf 'allow-external-apps = true\nbell-character=ignore\n' > "$HOME/.termux/termux.properties"
@@ -75,6 +77,35 @@ echo $SP > "$T/g.pid"; : > "$LOG_CALLS"
 sh "$HERE/../boot/20-guardian.sh"
 ok "single instance: exits when pidfile process alive" "! grep -q wake-lock '$LOG_CALLS'"
 kill $SP 2>/dev/null; wait $SP 2>/dev/null
+
+# auto-wake: só na transição Wi-Fi caído -> de volta, e só se o atheron não responde
+# shellcheck disable=SC2016  # literal $LOG_CALLS in the fake script
+printf '#!/bin/sh\necho "wake" >> "$LOG_CALLS"\ntouch "%s/woke"\nexit 0\n' "$T" > "$T/bin/fake-wake"; chmod +x "$T/bin/fake-wake"
+gw() { # gw <wifi true|false> <atheron true|false>: one guardian iteration, sshd fine
+    : > "$LOG_CALLS"; : > "$T/g.log"; rm -f "$T/g.pid" "$T/woke"
+    GUARDIAN_PORT_CHECK=true GUARDIAN_WIFI_CHECK=$1 GUARDIAN_ATHERON_CHECK=$2 sh "$HERE/../boot/20-guardian.sh"
+}
+export GUARDIAN_WIFI_STATE=$T/wifi GUARDIAN_WAKE_OFF=$T/wake.off GUARDIAN_WAKE_PID=$T/wake.pid
+export GUARDIAN_WAKE_CMD=fake-wake GUARDIAN_WAKE_TRIES=3 GUARDIAN_WAKE_GAP=0
+rm -f "$T/wifi"
+gw true false
+ok "auto-wake: guardian start with Wi-Fi up does not fire" "! grep -q '^wake' '$LOG_CALLS' && [ \"\$(cat '$T/wifi')\" = 1 ]"
+gw false false
+ok "auto-wake: Wi-Fi loss logged, no wake" "grep -q 'home Wi-Fi lost' '$T/g.log' && ! grep -q '^wake' '$LOG_CALLS'"
+gw true false
+ok "auto-wake: Wi-Fi back + atheron down -> wakes every round" "[ \$(grep -c '^wake' '$LOG_CALLS') -eq 3 ] && grep -q 'magic packet sent (3/3)' '$T/g.log'"
+ok "auto-wake: gives up with a log line" "grep -q 'still down after 3 rounds' '$T/g.log'"
+gw true false
+ok "auto-wake: Wi-Fi still up -> nothing" "! grep -q '^wake' '$LOG_CALLS'"
+gw false false; gw true true
+ok "auto-wake: atheron already up -> no packet" "! grep -q '^wake' '$LOG_CALLS' && grep -q 'already up' '$T/g.log'"
+printf '0\n' > "$T/wifi"
+GUARDIAN_PORT_CHECK=true GUARDIAN_WIFI_CHECK=true GUARDIAN_ATHERON_CHECK="[ -e '$T/woke' ]" sh -c ': > "$LOG_CALLS"; : > "$0/g.log"; rm -f "$0/g.pid" "$0/woke"; sh "$1"' "$T" "$HERE/../boot/20-guardian.sh"
+ok "auto-wake: stops as soon as the atheron answers" "[ \$(grep -c '^wake' '$LOG_CALLS') -eq 1 ] && grep -q 'answered (round 2)' '$T/g.log'"
+touch "$T/wake.off"; gw false false; gw true false
+ok "auto-wake: disabled by ~/.acordar-atheron.off" "! grep -q '^wake' '$LOG_CALLS' && grep -q 'auto-wake disabled' '$T/g.log'"
+rm -f "$T/wake.off"
+unset GUARDIAN_WIFI_STATE GUARDIAN_WAKE_OFF GUARDIAN_WAKE_PID GUARDIAN_WAKE_CMD GUARDIAN_WAKE_TRIES GUARDIAN_WAKE_GAP
 
 # sshd_config com várias linhas ListenAddress comentadas/duplicadas -> uma só
 printf '#ListenAddress 0.0.0.0\n#ListenAddress ::\nListenAddress 10.0.0.1\nListenAddress 10.0.0.2\nPort 22\n' > "$PREFIX/etc/ssh/sshd_config"
