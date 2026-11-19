@@ -29,6 +29,7 @@ Python 3 só stdlib (atheron = Debian, python3.13), bash, sh do Termux. Sem gere
 - `nomad/`: `s10` (wrapper scrcpy), `s10.desktop`, `tests/test_s10.sh` (ssh/adb/scrcpy falsos no PATH).
 - Wake-on-LAN: `atheron/wol-atheron.sh` (regra udev `81-cerberus-wol.rules`, não mexe em `/etc/network/interfaces`, que é gerado pelo cerberus-ia/net) + `termux/acordar-atheron` (pacote mágico por `socat`, dash sem `\x`) + `s10 acordar-atheron` (fala direto com o Termux, nunca via atheron). Automático no `20-guardian.sh`: Wi-Fi de casa caído → de volta dispara `acordar-atheron` se o atheron não responde (`~/.acordar-atheron.off` desliga). Não dá para simular a queda pelo adb: o `cerberus-s10` religa o Wi-Fi em ≤30 s, antes do ciclo de 60 s do vigia.
 
+- Resumo público: `public_summary()` publica `/run/cerberus-s10-publico/resumo.json` (0644) por LISTA PERMITIDA (sem IP/porta/serial); nunca copie/filtre o `estado.json` (privado, 0640) para ele. O formato é contrato do painel do Kindle (`versao: 1`).
 - Guardião: `cerberus-s10` repara o celular (read-then-write) e publica `caminhos` em estado.json; segredo do droidVNC-NG só via `LoadCredential` + stdin do `adb shell`, nunca argv/log. Drills em `docs/testes-de-falha.md`.
 
 ## Convenções

@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import stat
 import tempfile
 import unittest
@@ -129,6 +130,89 @@ class Collect(unittest.TestCase):
 def snap(estado="device", nivel=50, temp=30.0):
     return {"estado": estado,
             "bateria": {"nivel": nivel, "temperatura_c": temp} if estado == "device" else None}
+
+
+def full_snap():
+    return {
+        "timestamp": "2026-11-16T12:00:00+00:00", "epoch": 1000, "conectado": True, "estado": "device",
+        "serial": "R58M12ABCDE",
+        "bateria": {"nivel": 87, "temperatura_c": 31.2, "status": "charging", "plugado": ["usb"],
+                    "saude": "good", "tensao_mv": 4123},
+        "tela": "Awake", "wifi": {"ligado": True, "conectado": True, "ssid": "homenet"},
+        "caminhos": {
+            "usb": {"ok": True, "estado": "device"},
+            "adb_sem_fio": {"ip_lan": "192.0.2.50", "porta": 37123, "ip_tailnet": "100.64.0.10",
+                            "ok": False, "ok_tailnet": True, "ativa": "usb"},
+            "tailscale": {"ok": True, "ip": "100.64.0.10"},
+            "ssh_termux": {"ok": True, "porta": 8022},
+            "vnc": {"ok": None, "porta": 5900, "loopback": None},
+        },
+        "guardiao": {"reparos": ["x"], "reparar": True, "shizuku": {"ok": True}},
+    }
+
+
+class PublicSummary(unittest.TestCase):
+    def test_public_summary_whitelist(self):
+        out = m.public_summary(full_snap(), m.Alerts(), 1000)
+        self.assertEqual(set(out), {"versao", "gerado_em", "bateria", "caminhos", "avisos"})
+        self.assertEqual(out["versao"], 1)
+        self.assertEqual(out["gerado_em"], 1000)
+        self.assertEqual(set(out["bateria"]), {"nivel", "status", "temperatura_c", "saude"})
+        self.assertEqual(set(out["caminhos"]), {"usb", "adb_sem_fio", "tailscale", "ssh_termux", "vnc"})
+        self.assertEqual(out["caminhos"], {"usb": True, "adb_sem_fio": False, "tailscale": True,
+                                           "ssh_termux": True, "vnc": None})
+        text = json.dumps(out)
+        self.assertIsNone(re.search(r"\d+\.\d+\.\d+\.\d+", text))
+        for secret in ("37123", "8022", "5900", "R58M12ABCDE", "homenet", "device", "guardiao", "serial"):
+            self.assertNotIn(secret, text)
+
+    def test_public_summary_unknown_path_is_null(self):
+        s = full_snap()
+        del s["caminhos"]["vnc"]
+        del s["caminhos"]["tailscale"]["ok"]
+        out = m.public_summary(s, m.Alerts(), 1000)
+        self.assertIsNone(out["caminhos"]["vnc"])
+        self.assertIsNone(out["caminhos"]["tailscale"])
+        s.pop("caminhos")
+        out = m.public_summary(s, m.Alerts(), 1000)
+        self.assertEqual(out["caminhos"], {k: None for k in ("usb", "adb_sem_fio", "tailscale", "ssh_termux", "vnc")})
+
+    def test_public_summary_no_battery(self):
+        s = full_snap()
+        s["bateria"] = None
+        out = m.public_summary(s, m.Alerts(), 1000)
+        self.assertIsNone(out["bateria"])
+        self.assertEqual(out["avisos"], [])
+
+    def test_public_summary_alert_codes(self):
+        s = full_snap()
+        s["bateria"]["temperatura_c"] = 46.0
+        self.assertEqual(m.public_summary(s, m.Alerts(), 1000)["avisos"], ["temperatura"])
+        s["bateria"].update(temperatura_c=30.0, nivel=100)
+        a = m.Alerts(full_hours=1)
+        self.assertEqual(m.public_summary(s, a, 1000)["avisos"], [])     # not tracked yet
+        a.full_since = 1000 - 3600
+        self.assertEqual(m.public_summary(s, a, 1000)["avisos"], ["carga_cheia"])
+        a.full_since = 1000 - 3599
+        self.assertEqual(m.public_summary(s, a, 1000)["avisos"], [])
+
+
+class PublicSummaryIsolation(unittest.TestCase):
+    def test_unwritable_public_path_does_not_stop_estado(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            fake_adb = os.path.join(d, "adb")
+            with open(fake_adb, "w") as f:
+                f.write("#!/bin/sh\nexit 1\n")
+            os.chmod(fake_adb, 0o755)
+            estado = os.path.join(d, "estado.json")
+            env = {"S10_ADB": fake_adb, "S10_STATE": estado, "S10_ADB_SOCKET": "",
+                   "S10_PUBLIC": os.path.join(d, "missing-dir", "resumo.json")}
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual(m.main(["--once"]), 0)
+            with open(estado) as f:
+                self.assertEqual(json.load(f)["estado"], "ausente")
+            self.assertFalse(os.path.exists(env["S10_PUBLIC"]))
 
 
 class AlertsTest(unittest.TestCase):

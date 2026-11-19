@@ -44,6 +44,8 @@ ProcSubset=pid
 MemoryDenyWriteExecute=yes
 SystemCallFilter=@system-service
 ProtectSystem=strict
+# public, whitelisted summary for dashboards; "-" so a missing dir never stops the guardian (dir created by tmpfiles.d, see cerberus-s10-publico.tmpfiles)
+ReadWritePaths=-/run/cerberus-s10-publico
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes

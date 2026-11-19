@@ -11,6 +11,8 @@ BIN=/usr/local/sbin/cerberus-s10
 ESTADO_BIN=/usr/local/sbin/cerberus-s10-estado
 UNIT=/etc/systemd/system/cerberus-s10.service
 RULE=/etc/udev/rules.d/51-cerberus-s10.rules
+TMPF=/etc/tmpfiles.d/cerberus-s10-publico.conf
+PUBDIR=/run/cerberus-s10-publico
 SSHD_DIR=${S10_SSHD_DIR:-/etc/ssh/sshd_config.d}
 DROPIN=$SSHD_DIR/50-s10tunnel.conf
 SHELLS=${S10_SHELLS:-/etc/shells}
@@ -45,6 +47,12 @@ check() {
     if grep -qs '^restrict,port-forwarding' "$TUN_HOME/.ssh/authorized_keys"; then
         ok "$TUN_HOME/.ssh/authorized_keys restrito ($(grep -c '^restrict' "$TUN_HOME/.ssh/authorized_keys") chave(s))"
     else bad "nenhuma chave do nomad em $TUN_HOME/.ssh/authorized_keys (use --tunnel-key <arquivo.pub>)"; fi
+    if [ -f "$TMPF" ]; then ok "tmpfiles $TMPF"; else bad "tmpfiles $TMPF"; fi
+    if [ -d "$PUBDIR" ]; then ok "diretório público $PUBDIR ($(stat -c '%a %U' "$PUBDIR"))"; else bad "diretório $PUBDIR ausente"; fi
+    if [ -f "$PUBDIR/resumo.json" ]; then
+        if [ "$(stat -c %a "$PUBDIR/resumo.json")" = 644 ]; then ok "resumo.json 644 (sem IP/porta/serial)"
+        else bad "resumo.json com modo $(stat -c %a "$PUBDIR/resumo.json") (esperado 644)"; fi
+    else bad "$PUBDIR/resumo.json ainda não existe"; fi
     if [ -f "$RULE" ]; then ok "regra udev"; else bad "regra udev $RULE"; fi
     if [ -x "$BIN" ]; then ok "$BIN"; else bad "$BIN"; fi
     if [ -x "$ESTADO_BIN" ]; then ok "$ESTADO_BIN"; else bad "$ESTADO_BIN"; fi
@@ -131,7 +139,8 @@ case "${1:-}" in
 --undo)
     [ "$(id -u)" -eq 0 ] || { echo "rode como root"; exit 1; }
     systemctl disable --now cerberus-s10 2>/dev/null || true
-    rm -f "$UNIT" "$BIN" "$RULE"
+    rm -f "$UNIT" "$BIN" "$RULE" "$TMPF"
+    rm -rf "$PUBDIR"
     if id "$TUN_USER" >/dev/null 2>&1; then usermod -s /bin/sh "$TUN_USER" || true; fi
     [ -L "$TUN_HOME/adb.sock" ] && rm -f "$TUN_HOME/adb.sock"
     rm -f "$ESTADO_BIN"
@@ -207,6 +216,8 @@ if ! reload_sshd; then
 fi
 install -m 0644 "$HERE/51-cerberus-s10.rules" "$RULE"
 install -m 0644 "$HERE/cerberus-s10.service" "$UNIT"
+install -m 0644 "$HERE/cerberus-s10-publico.tmpfiles" "$TMPF"
+systemd-tmpfiles --create "$TMPF"
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=usb --attr-match=idVendor=04e8 || true
 systemctl daemon-reload
