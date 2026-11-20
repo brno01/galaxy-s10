@@ -62,6 +62,9 @@ export GUARDIAN_ONCE=1 GUARDIAN_LOG=$T/g.log GUARDIAN_PID=$T/g.pid
 sh "$HERE/../boot/20-guardian.sh"
 ok "guardian restarts sshd when down" "grep -q '^sshd' '$LOG_CALLS' && grep -q 'sshd restarted' '$T/g.log'"
 ok "guardian holds wake lock" "grep -q 'termux-wake-lock' '$LOG_CALLS'"
+# From here on sshd counts as up. Answer the port check locally: without this the guardian probes the
+# real phone on the tailnet, so the test only passed on a machine that could reach it.
+export GUARDIAN_PORT_CHECK=true
 touch "$T/sshd.up"; : > "$LOG_CALLS"; rm -f "$T/g.pid"
 sh "$HERE/../boot/20-guardian.sh"
 ok "guardian leaves a live sshd alone" "! grep -q '^sshd' '$LOG_CALLS'"
