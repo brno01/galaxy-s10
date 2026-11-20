@@ -7,7 +7,7 @@ WAKE=$HERE/../../termux/acordar-atheron
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/sys/enp9s0/device/power"
-echo "02:00:00:00:00:aa" > "$T/sys/enp9s0/address"
+printf "02:00:00:00:00:%s\n" AA > "$T/sys/enp9s0/address"
 echo disabled > "$T/sys/enp9s0/device/power/wakeup"
 # ethtool falso: guarda o último "wol X" e o devolve no Wake-on
 cat > "$T/bin/ethtool" <<F
@@ -36,11 +36,11 @@ ok "prints the S10 command" "grep -q 'acordar-atheron 02:00:00:00:00:aa' '$T/out
 cp "$WOL_RULE" "$T/rule.1"
 bash "$INST" > "$T/out" 2>&1
 ok "idempotent (same rule, not rewritten)" "cmp -s '$T/rule.1' '$WOL_RULE' && ! grep -q 'regra gravada' '$T/out'"
-echo "11:22:33:44:55:66" > "$T/sys/enp9s0/address"
+echo "02:00:00:00:00:bb" > "$T/sys/enp9s0/address"
 bash "$INST" --check > "$T/out" 2>&1; rc=$?
 ok "check notices a different MAC" "[ $rc -ne 0 ] && grep -q '✗ regra udev' '$T/out'"
 bash "$INST" > /dev/null 2>&1
-ok "reinstall follows the new MAC" "grep -qF '11:22:33:44:55:66' '$WOL_RULE' && [ \$(grep -c ATTR '$WOL_RULE') -eq 1 ]"
+ok "reinstall follows the new MAC" "grep -qF '02:00:00:00:00:bb' '$WOL_RULE' && [ \$(grep -c ATTR '$WOL_RULE') -eq 1 ]"
 WOL_IFACE=nada bash "$INST" > "$T/out" 2>&1; rc=$?
 ok "missing interface rejected" "[ $rc -ne 0 ] && grep -q 'não encontrada' '$T/out'"
 bash "$INST" --undo > /dev/null 2>&1; rc=$?
@@ -50,20 +50,22 @@ ok "unknown option rejected" "[ $rc -eq 2 ]"
 
 # termux/acordar-atheron: packet = 6 x ff + 16 x MAC (102 bytes), under dash when available
 SH=$(command -v dash || command -v sh)
-"$SH" "$WAKE" --dump 02:00:00:00:00:aa > "$T/pkt"; rc=$?
+printf 'ATHERON_MAC=02:00:00:00:00:aa\nATHERON_BCAST=192.0.2.255\n' > "$T/s10.conf"
+export S10_CONF="$T/s10.conf"
+"$SH" "$WAKE" --dump "$(printf "02:00:00:00:00:%s" Aa)" > "$T/pkt"; rc=$?
 ok "dump exits 0" "[ $rc -eq 0 ]"
 ok "packet has 102 bytes" "[ \$(wc -c < '$T/pkt') -eq 102 ]"
-expected=ffffffffffff$(printf '9829a6e7d5a6%.0s' $(seq 16))
+expected=ffffffffffff$(printf '0200000000aa%.0s' $(seq 16))
 ok "packet bytes are the magic packet" "[ \"\$(od -An -tx1 -v '$T/pkt' | tr -d ' \n')\" = '$expected' ]"
 "$SH" "$WAKE" --dump > "$T/pkt2"
-ok "default MAC is the atheron's" "[ \"\$(od -An -tx1 -v -j6 -N6 '$T/pkt2' | tr -d ' \n')\" = 9829a6e7d5a6 ]"
+ok "default MAC comes from the config file" "[ \"\$(od -An -tx1 -v -j6 -N6 '$T/pkt2' | tr -d ' \n')\" = 0200000000aa ]"
 ATHERON_MAC=00-11-22-33-44-ff "$SH" "$WAKE" --dump > "$T/pkt3"
 ok "ATHERON_MAC with dashes" "[ \"\$(od -An -tx1 -v -j96 -N6 '$T/pkt3' | tr -d ' \n')\" = 0011223344ff ]"
 "$SH" "$WAKE" --dump 98:29:a6:e7:d5 > /dev/null 2>&1; rc=$?
 ok "short MAC rejected" "[ $rc -eq 2 ]"
 "$SH" "$WAKE" --dump 'zz:29:a6:e7:d5:a6' > /dev/null 2>&1; rc=$?
 ok "non-hex MAC rejected" "[ $rc -eq 2 ]"
-mkdir "$T/nosocat"; ln -s "$(command -v tr)" "$T/nosocat/tr"
+mkdir "$T/nosocat"; for b in tr sed head; do ln -s "$(command -v $b)" "$T/nosocat/$b"; done
 PATH="$T/nosocat" "$SH" "$WAKE" > "$T/out" 2>&1; rc=$?
 ok "without socat: clear error" "[ $rc -ne 0 ] && grep -q 'pkg install socat' '$T/out'"
 

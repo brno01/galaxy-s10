@@ -8,6 +8,10 @@
 # Auto-wake: when the home Wi-Fi comes back (AP up again = power back after an outage, when cerberus-power-guard
 # may have powered the atheron off), wake the atheron by Wake-on-LAN until it answers. Off: touch ~/.acordar-atheron.off
 HOME_DIR=${HOME:-/data/data/com.termux/files/home}
+# Site values (LAN prefix, atheron IPs, tailnet IP) come from GUARDIAN_* env vars or, failing that, from the config
+# file written by bootstrap.sh (KEY=value lines, read as data, never executed): ~/.s10.conf, see termux/s10.conf.example
+CONF=${S10_CONF:-$HOME_DIR/.s10.conf}
+conf() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | head -n 1; }
 LOG=${GUARDIAN_LOG:-$HOME_DIR/guardian.log}
 PIDF=${GUARDIAN_PID:-$HOME_DIR/.guardian.pid}
 INTERVAL=${GUARDIAN_INTERVAL:-60}
@@ -16,10 +20,10 @@ MAX=${GUARDIAN_MAX_BYTES:-262144}
 SSH_PORT=${GUARDIAN_SSH_PORT:-8022}
 # the address sshd listens on (ListenAddress in sshd_config), else the tailnet default
 SSH_ADDR=${GUARDIAN_SSH_ADDR:-$(sed -n 's/^ListenAddress[[:space:]]\{1,\}//p' "${PREFIX:-/data/data/com.termux/files/usr}/etc/ssh/sshd_config" 2>/dev/null | head -n 1)}
-SSH_ADDR=${SSH_ADDR:-100.64.0.10}
+SSH_ADDR=${SSH_ADDR:-$(conf S10_TAILNET_IP)}   # still empty: the port check is skipped
 
-WAKE_SUBNET=${GUARDIAN_WAKE_SUBNET:-192.168.1.}                  # wlan0 IPv4 prefix of the home LAN
-ATHERON_IPS=${GUARDIAN_ATHERON_IPS:-192.0.2.10 192.0.2.11}   # cable, Wi-Fi
+WAKE_SUBNET=${GUARDIAN_WAKE_SUBNET:-$(conf GUARDIAN_WAKE_SUBNET)}   # wlan0 IPv4 prefix of the home LAN; empty = auto-wake off
+ATHERON_IPS=${GUARDIAN_ATHERON_IPS:-$(conf GUARDIAN_ATHERON_IPS)}   # atheron LAN IPs (cable, Wi-Fi), space separated
 WAKE_CMD=${GUARDIAN_WAKE_CMD:-acordar-atheron}
 WAKE_TRIES=${GUARDIAN_WAKE_TRIES:-10}
 WAKE_GAP=${GUARDIAN_WAKE_GAP:-30}
@@ -32,6 +36,7 @@ log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >> "$LOG"; }
 # home Wi-Fi = wlan0 has an IPv4 in the home LAN (works without root and without the Termux:API app)
 home_wifi() {
     if [ -n "${GUARDIAN_WIFI_CHECK:-}" ]; then sh -c "$GUARDIAN_WIFI_CHECK"; return; fi
+    [ -n "$WAKE_SUBNET" ] || return 1   # an empty prefix would match every address
     /system/bin/ip -4 -o addr show wlan0 2>/dev/null | grep -qF "inet $WAKE_SUBNET"
 }
 
@@ -77,6 +82,7 @@ wake_check() {
 # true when something accepts TCP on SSH_ADDR:SSH_PORT (bash /dev/tcp; GUARDIAN_PORT_CHECK overrides for tests)
 port_open() {
     if [ -n "${GUARDIAN_PORT_CHECK:-}" ]; then sh -c "$GUARDIAN_PORT_CHECK"; return; fi
+    [ -n "$SSH_ADDR" ] || return 0   # address unknown: only the process check applies
     timeout 4 bash -c "</dev/tcp/$SSH_ADDR/$SSH_PORT" 2>/dev/null
 }
 

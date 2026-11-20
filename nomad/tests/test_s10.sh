@@ -82,7 +82,7 @@ export S10_ATHERON=root@atheron-test S10_VNC_LPORT=15901 XDG_RUNTIME_DIR="$TMP/r
 mkdir -m 700 "$TMP/run"
 SOCK="$TMP/run/s10-adb.sock"
 SOCKRE="localfilesystem:$SOCK"
-unset S10_TERMUX_USER
+export S10_TERMUX_USER=u0_a999 S10_DEFAULT_SERIAL=EXAMPLESERIAL
 export S10_PHONE=celular-test S10_TAILNET_IP=100.64.0.9
 
 DEV='List of devices attached\nR58M12ABCDE\tdevice\n\n'
@@ -184,7 +184,7 @@ check "S10_TUNNEL honored" ' t@h$'
 reset_env
 FAKE_LOCAL_DEVICES='List of devices attached\n192.0.2.60:37123\tdevice\nR58M12ABCDE\tdevice\n\n' run --lan
 refute "lan: no ssh" '^ssh'
-check "lan: wireless serial" 'scrcpy\[\] -s 192\.168\.0\.50:37123'
+check "lan: wireless serial" 'scrcpy\[\] -s 192\.0\.2\.60:37123'
 FAKE_LOCAL_DEVICES=$DEV run --lan
 expect_rc "lan without wireless device fails" eq 1
 check "lan: PT error" 'Wi-Fi' "$TMP/err"
@@ -204,8 +204,8 @@ FAKE_USB_DEVICES='List of devices attached\n\n' FAKE_STATE='{"estado":"ausente",
 check "auto: usb failed message" 'caminho 1 falhou' "$TMP/err"
 check "auto: state fetched over ssh" 'ssh .*atheron-test cat /run/cerberus-s10/estado.json'
 check "state fetch: forwardings cleared" 'ClearAllForwardings=yes.*cat /run/cerberus-s10/estado.json'
-check "auto: adb connect LAN ip:port" 'adb\[\] connect 192\.168\.1\.249:37215'
-check "auto: scrcpy -s wireless, local adb" 'scrcpy\[\] -s 192\.168\.1\.249:37215'
+check "auto: adb connect LAN ip:port" 'adb\[\] connect 192\.0\.2\.20:37215'
+check "auto: scrcpy -s wireless, local adb" 'scrcpy\[\] -s 192\.0\.2\.20:37215'
 refute "auto: vnc not tried" 'ssh .*-L 15901'
 before "auto: path 1 before path 2" 'adb\['"$SOCKRE"'\] devices' 'adb\[\] connect'
 n=$((n + 1)); if grep -q '"porta":37215' "$XDG_CACHE_HOME/s10/estado.json" 2>/dev/null; then echo "ok   cache written"; else echo "FAIL cache written"; fail=$((fail + 1)); fi
@@ -220,14 +220,14 @@ check "auto: scrcpy on tailnet" 'scrcpy\[\] -s 100\.64\.0\.9:37215'
 refute "auto: mDNS not needed" 'mdns services'
 FAKE_USB_DEVICES='List of devices attached\n\n' FAKE_STATE='{"caminhos":{"adb_sem_fio":{"ip_lan":"192.0.2.30","porta":37215,"ip_tailnet":"100.64.0.9"}}}' \
     FAKE_CONNECT_OK="192.0.2.30:37215" run
-before "auto: tailnet before LAN" 'connect 100\.64\.0\.9' 'connect 192\.168\.1\.243'
-check "auto: LAN as fallback" 'scrcpy\[\] -s 192\.168\.1\.243:37215'
+before "auto: tailnet before LAN" 'connect 100\.64\.0\.9' 'connect 192\.0\.2\.30'
+check "auto: LAN as fallback" 'scrcpy\[\] -s 192\.0\.2\.30:37215'
 
 # atheron fora do ar: mDNS
 reset_env
 FAKE_ATHERON_DOWN=1 FAKE_MDNS='adb-R58M-abc\t_adb-tls-connect._tcp\t192.0.2.20:40001\n' FAKE_CONNECT_OK="192.0.2.20:40001" run
 check "auto: atheron down -> path 2 via mDNS" 'adb\[\] mdns services'
-check "auto: mDNS candidate connected" 'scrcpy\[\] -s 192\.168\.1\.249:40001'
+check "auto: mDNS candidate connected" 'scrcpy\[\] -s 192\.0\.2\.20:40001'
 refute "auto: no tailnet attempt before mDNS" 'connect 100\.64\.0\.9'
 
 # avahi-browse como segunda fonte
@@ -235,7 +235,7 @@ reset_env
 FAKE_ATHERON_DOWN=1 FAKE_AVAHI='=;wlan0;IPv4;adb-R58M;_adb-tls-connect._tcp;local;s10.local;192.0.2.20;40002;"x"\n=;wlan0;IPv6;adb-R58M;_adb-tls-connect._tcp;local;s10.local;fe80::1;40002;"x"\n' \
     FAKE_CONNECT_OK="192.0.2.20:40002" run
 check "auto: avahi-browse used" 'avahi-browse -rtp _adb-tls-connect\._tcp'
-check "auto: avahi candidate connected" 'scrcpy\[\] -s 192\.168\.1\.249:40002'
+check "auto: avahi candidate connected" 'scrcpy\[\] -s 192\.0\.2\.20:40002'
 
 # cache: tailnet + última porta
 reset_env
@@ -248,7 +248,7 @@ check "auto: scrcpy from cache" 'scrcpy\[\] -s 100\.64\.0\.9:45678'
 reset_env
 FAKE_USB_DEVICES='List of devices attached\n\n' FAKE_STATE=$STATE_NOPORT run
 check "auto: path 2 failed message" 'caminho 2 falhou' "$TMP/err"
-check "auto: vnc tunnel to phone name, default Termux user" 'ssh -N -p 8022 .*-L 127\.0\.0\.1:15901:127\.0\.0\.1:5900 u0_a999@celular-test'
+check "auto: vnc tunnel to phone name, configured Termux user" 'ssh -N -p 8022 .*-L 127\.0\.0\.1:15901:127\.0\.0\.1:5900 u0_a999@celular-test'
 check "auto: krdc on forwarded port" 'krdc vnc://127\.0\.0\.1:15901'
 refute "auto: no scrcpy when only vnc works" '^scrcpy'
 before "auto: path 2 before path 3" 'ssh .*cat /run/cerberus-s10' 'ssh -N -p 8022'
@@ -355,7 +355,7 @@ check "all fail: points to status" "s10 status" "$TMP/err"
 reset_env
 FAKE_SCRCPY_FAIL_USB=1 FAKE_USB_DEVICES=$DEV FAKE_STATE='{"caminhos":{"adb_sem_fio":{"ip":"192.0.2.20","porta":37215}}}' \
     FAKE_CONNECT_OK="192.0.2.20:37215" run
-check "auto: scrcpy usb failure -> path 2" 'scrcpy\[\] -s 192\.168\.1\.249:37215'
+check "auto: scrcpy usb failure -> path 2" 'scrcpy\[\] -s 192\.0\.2\.20:37215'
 check "auto: reason reported" 'scrcpy falhou logo' "$TMP/err"
 
 # flags forçam um caminho só
@@ -412,6 +412,19 @@ refute "help prints only the comment block" '^ADMIN_HOST|^set -u' "$TMP/out"
 
 run --nada
 expect_rc "unknown option rejected" ne 0
+
+# site values from the local config file (KEY=value, read as data); the environment wins over the file
+reset_env
+printf 'S10_TERMUX_USER=u0_a111\nS10_TAILNET_IP=100.64.0.77\nS10_DEFAULT_SERIAL=FILESERIAL01\n' > "$TMP/s10.conf"
+DEVF='List of devices attached\nR58M12ABCDE\tdevice\nFILESERIAL01\tdevice\n\n'
+(unset S10_TERMUX_USER S10_TAILNET_IP S10_DEFAULT_SERIAL; S10_CONFIG="$TMP/s10.conf" FAKE_USB_DEVICES=$DEVF run --usb)
+check "config file: default serial" 'scrcpy.* -s FILESERIAL01'
+(unset S10_TERMUX_USER S10_TAILNET_IP S10_DEFAULT_SERIAL; S10_CONFIG="$TMP/s10.conf" FAKE_ATHERON_DOWN=1 FAKE_PHONE_DOWN=1 run --vnc)
+check "config file: Termux user and tailnet IP" 'u0_a111@100\.64\.0\.77'
+(S10_CONFIG="$TMP/s10.conf" FAKE_ATHERON_DOWN=1 FAKE_PHONE_DOWN=1 run --vnc)
+check "environment wins over the config file" 'u0_a999@100\.64\.0\.9'
+(unset S10_TERMUX_USER S10_TAILNET_IP S10_DEFAULT_SERIAL; S10_CONFIG="$TMP/none" FAKE_USB_DEVICES=$DEVF run --usb)
+refute "no config: no preferred serial" 'FILESERIAL01'
 
 echo "--- $n checks, $fail failed"
 [ "$fail" -eq 0 ]

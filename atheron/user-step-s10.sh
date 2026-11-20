@@ -12,6 +12,8 @@ ESTADO_BIN=/usr/local/sbin/cerberus-s10-estado
 UNIT=/etc/systemd/system/cerberus-s10.service
 RULE=/etc/udev/rules.d/51-cerberus-s10.rules
 TMPF=/etc/tmpfiles.d/cerberus-s10-publico.conf
+DEFAULTS=${S10_DEFAULTS:-/etc/default/cerberus-s10}   # EnvironmentFile of the unit: site values (tailnet IP, home Wi-Fi, serial)
+LOCAL_ENV=$HERE/s10.local.env                         # git-ignored; format in s10.env.example
 PUBDIR=/run/cerberus-s10-publico
 SSHD_DIR=${S10_SSHD_DIR:-/etc/ssh/sshd_config.d}
 DROPIN=$SSHD_DIR/50-s10tunnel.conf
@@ -57,6 +59,8 @@ check() {
     if [ -x "$BIN" ]; then ok "$BIN"; else bad "$BIN"; fi
     if [ -x "$ESTADO_BIN" ]; then ok "$ESTADO_BIN"; else bad "$ESTADO_BIN"; fi
     if [ -f "$UNIT" ]; then ok "unit"; else bad "unit $UNIT"; fi
+    if grep -qs '^S10_TAILNET_IP=.' "$DEFAULTS"; then ok "$DEFAULTS com S10_TAILNET_IP"
+    else bad "$DEFAULTS sem S10_TAILNET_IP (copie atheron/s10.env.example para atheron/s10.local.env, preencha e reinstale)"; fi
     if systemctl is-active --quiet cerberus-s10; then ok "serviço ativo"; else bad "serviço inativo"; fi
     if command -v ping >/dev/null; then ok "ping (sonda do Tailscale)"; else bad "ping (apt install iputils-ping)"; fi
     if command -v avahi-browse >/dev/null; then ok "avahi-browse (fallback mDNS)"; else echo "aviso:  avahi-utils ausente (o guardião usa só 'adb mdns services')"; fi
@@ -150,7 +154,7 @@ case "${1:-}" in
         [ -f "$DROPIN.antes-s10" ] && cp -a "$DROPIN.antes-s10" "$DROPIN"
         reload_sshd || true
     fi
-    for f in "$UNIT" "$RULE"; do
+    for f in "$UNIT" "$RULE" "$DEFAULTS"; do
         [ -f "$f.antes-s10" ] && cp -a "$f.antes-s10" "$f"
     done
     systemctl daemon-reload
@@ -194,7 +198,7 @@ if [ ! -s "$PWFILE" ]; then
     chmod 600 "$PWFILE"
 fi
 # 4) cópia de segurança (uma vez) do que existir
-for f in "$UNIT" "$RULE" "$DROPIN"; do
+for f in "$UNIT" "$RULE" "$DROPIN" "$DEFAULTS"; do
     [ -f "$f" ] && [ ! -f "$f.antes-s10" ] && cp -a "$f" "$f.antes-s10"
 done
 # 5) instala
@@ -216,6 +220,18 @@ if ! reload_sshd; then
 fi
 install -m 0644 "$HERE/51-cerberus-s10.rules" "$RULE"
 install -m 0644 "$HERE/cerberus-s10.service" "$UNIT"
+# site values: merge atheron/s10.local.env into $DEFAULTS (replaces only the keys it has; other lines are kept)
+if [ -f "$LOCAL_ENV" ]; then
+    [ -f "$DEFAULTS" ] || install -m 0640 -o root -g root /dev/null "$DEFAULTS"
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[A-Z0-9_]+=.*$ ]] || continue
+        grep -v "^${line%%=*}=" "$DEFAULTS" > "$DEFAULTS.tmp" || true
+        printf '%s\n' "$line" >> "$DEFAULTS.tmp"
+        cat "$DEFAULTS.tmp" > "$DEFAULTS"; rm -f "$DEFAULTS.tmp"
+    done < "$LOCAL_ENV"
+elif ! grep -qs '^S10_TAILNET_IP=.' "$DEFAULTS"; then
+    echo "AVISO: sem $LOCAL_ENV e sem S10_TAILNET_IP em $DEFAULTS: o serviço não sobe. Copie atheron/s10.env.example para atheron/s10.local.env, preencha e rode de novo."
+fi
 install -m 0644 "$HERE/cerberus-s10-publico.tmpfiles" "$TMPF"
 systemd-tmpfiles --create "$TMPF"
 udevadm control --reload-rules

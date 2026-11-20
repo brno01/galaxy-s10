@@ -77,9 +77,9 @@ Com o celular reiniciando, o **vigia do Termux** (`~/.termux/boot/20-guardian.sh
 - **Túnel do caminho 1**: um `ssh` como `s10tunnel` com `-L $XDG_RUNTIME_DIR/s10-adb.sock:/run/cerberus-s10/adb.sock` (socket unix do adb, `StreamLocalBindUnlink=yes`) e `-L 127.0.0.1:27183:127.0.0.1:27183` (vídeo), `ADB_SERVER_SOCKET=localfilesystem:$XDG_RUNTIME_DIR/s10-adb.sock` e `scrcpy --force-adb-forward`. O `s10` apaga o socket velho e espera o socket novo existir antes de chamar o adb (sem servidor ali o cliente adb subiria um servidor LOCAL nesse caminho).
 - **Áudio** pelo túnel SSH derruba a sessão ("Demuxer 'audio'...", "Controller error"): o caminho USB usa `--no-audio`; `--audio` reativa. **Codec**: h264 por padrão (h265 com decodificação por software no nomad é mais lento; `S10_CODEC=h265` testa).
 - **Depuração sem fio que se desliga sozinha**: no Wi-Fi da casa marque **"Sempre permitir nesta rede"** no diálogo de depuração sem fio. O guardião relê `adb_wifi_enabled` 3 s depois de religar e, se voltar a 0, registra `rede não confiável para depuração sem fio` (uma vez).
-- **Porta TLS**: nesta versão do One UI `getprop service.adb.tls.port` vem vazio e o shell não enxerga o socket do adbd. O adbd escuta em **todas** as interfaces, então o `adb connect <ip-da-tailnet>:<porta>` funciona fora de casa; só a porta é aleatória (muda a cada ativação ou reinício). Quem a descobre é o **atheron**. O mDNS da LAN é invisível para ele (o firewall do host descarta o multicast 5353; não mexemos nisso), então a fonte **primária** é o logcat por USB: com a depuração sem fio ligada, o guardião lê `logcat -d -b all | grep -o 'Received tls port=[0-9]*' | tail -1` (o adbd registra a porta toda vez que liga; aceita 1024-65535) e confirma por TCP na tailnet (`ok_tailnet`). Se a linha saiu do buffer e nenhuma fonte conhece a porta, ele alterna `adb_wifi_enabled` 0, 2 s, 1, 3 s e relê (`REPAIR adb_wifi_port`, no máximo a cada 10 min; derruba uma sessão sem fio aberta, o que só acontece quando a porta é desconhecida). Reservas, nesta ordem: `getprop service.adb.tls.port`, `adb mdns services` e `avahi-browse -rpt _adb-tls-connect._tcp` (o instalador põe `avahi-utils` se faltar). O serviço é filtrado por `adb-EXAMPLESERIAL-*` e o guardião publica `caminhos.adb_sem_fio{ip_lan, porta, ip_tailnet, ok}` (`ok` = TCP na tailnet ou na LAN). O `s10 --sem-fio` lê isso pelo SSH, conecta na **tailnet primeiro**, depois na LAN, depois na última porta do cache `~/.cache/s10/`, e só então no mDNS local (em casa). O nomad já precisa estar pareado.
+- **Porta TLS**: nesta versão do One UI `getprop service.adb.tls.port` vem vazio e o shell não enxerga o socket do adbd. O adbd escuta em **todas** as interfaces, então o `adb connect <ip-da-tailnet>:<porta>` funciona fora de casa; só a porta é aleatória (muda a cada ativação ou reinício). Quem a descobre é o **atheron**. O mDNS da LAN é invisível para ele (o firewall do host descarta o multicast 5353; não mexemos nisso), então a fonte **primária** é o logcat por USB: com a depuração sem fio ligada, o guardião lê `logcat -d -b all | grep -o 'Received tls port=[0-9]*' | tail -1` (o adbd registra a porta toda vez que liga; aceita 1024-65535) e confirma por TCP na tailnet (`ok_tailnet`). Se a linha saiu do buffer e nenhuma fonte conhece a porta, ele alterna `adb_wifi_enabled` 0, 2 s, 1, 3 s e relê (`REPAIR adb_wifi_port`, no máximo a cada 10 min; derruba uma sessão sem fio aberta, o que só acontece quando a porta é desconhecida). Reservas, nesta ordem: `getprop service.adb.tls.port`, `adb mdns services` e `avahi-browse -rpt _adb-tls-connect._tcp` (o instalador põe `avahi-utils` se faltar). O serviço é filtrado por `adb-<serial>-*` (`S10_MDNS_SERIAL`) e o guardião publica `caminhos.adb_sem_fio{ip_lan, porta, ip_tailnet, ok}` (`ok` = TCP na tailnet ou na LAN). O `s10 --sem-fio` lê isso pelo SSH, conecta na **tailnet primeiro**, depois na LAN, depois na última porta do cache `~/.cache/s10/`, e só então no mDNS local (em casa). O nomad já precisa estar pareado.
 - **`s10 --desktop`**: antes do scrcpy liga `force_desktop_mode_on_external_displays=1` e `enable_freeform_support=1` por adb e abre `--new-display=1920x1080/160`. É o modo desktop do AOSP num display virtual; na primeira vez pode ser preciso reiniciar o celular. O Samsung DeX de verdade exige HDMI ou o app DeX do Windows.
-- Padrões do nomad: usuário do Termux `u0_a999`, chave `~/.ssh/nomad_ed25519` (usada se existir), serial `EXAMPLESERIAL` (preferido se listado). O atheron **não** faz login no Termux (o guardião só sonda o banner do sshd), então a chave dele não entra no `authorized_keys` do celular; se ela já estiver lá, remova no Termux com `sh bootstrap.sh --remove-key <comentario>` (por exemplo `atheron-s10`).
+- Padrões do nomad: chave `~/.ssh/nomad_ed25519` (usada se existir); usuário do Termux, serial preferido e IPs vêm da configuração local (ver "Valores do site"). O atheron **não** faz login no Termux (o guardião só sonda o banner do sshd), então a chave dele não entra no `authorized_keys` do celular; se ela já estiver lá, remova no Termux com `sh bootstrap.sh --remove-key <comentario>` (por exemplo `atheron-s10`).
 
 ### Segredo do droidVNC-NG (chave de acesso da interface de intents)
 
@@ -94,7 +94,7 @@ A chave fica em `/etc/cerberus-s10/vnc-access-key` (root, 0600) e a unit a entre
 
 ### Variáveis do guardião (`/etc/default/cerberus-s10`)
 
-`S10_INTERVAL` (30), `S10_TAILNET_IP`, `S10_TS_PROBE` (`ping`|`off`), `S10_SSH_PORT` (8022), `S10_VNC_PORT` (5900), `S10_VNC_IFACE` (`lo`), `S10_REPAIR=0` (só observa e registra o desvio), `S10_COOLDOWN` (120 s entre tentativas de iniciar apps), `S10_WIFI_IFACE` (wlan0).
+`S10_INTERVAL` (30), `S10_TAILNET_IP` (**obrigatório**: sem ele o serviço não sobe), `S10_HOME_SSID`, `S10_HOME_BSSID`, `S10_MDNS_SERIAL`, `S10_TS_PROBE` (`ping`|`off`), `S10_SSH_PORT` (8022), `S10_VNC_PORT` (5900), `S10_VNC_IFACE` (`lo`), `S10_REPAIR=0` (só observa e registra o desvio), `S10_COOLDOWN` (120 s entre tentativas de iniciar apps), `S10_WIFI_IFACE` (wlan0).
 
 ### Uma vez, com o S10 ainda utilizável
 
@@ -148,6 +148,7 @@ Sem teclado no S10, empurre os arquivos e rode pelo scrcpy (ou cole no Termux):
 ```
 # no atheron (ou no nomad com o túnel): copia os arquivos
 adb push termux/bootstrap.sh termux/boot/10-sshd.sh /sdcard/Download/
+adb push termux/s10.local.conf /sdcard/Download/               # valores do site (modelo: termux/s10.conf.example)
 adb push minhas-chaves.pub /sdcard/Download/s10-keys.pub     # formato: termux/authorized_keys.example
 
 # dentro do Termux (via scrcpy)
@@ -217,6 +218,7 @@ Enquanto o passo 2 não for feito, o guardião **não inicia o VNC** (registra u
 
 ```
 install -m755 nomad/s10 ~/.local/bin/s10
+install -D -m600 nomad/s10.local.conf ~/.config/s10/config      # valores do site (modelo: nomad/s10.conf.example)
 install -m644 nomad/s10.desktop ~/.local/share/applications/
 s10                 # automático (USB, depois sem fio, depois VNC); `s10 status` mostra cada caminho
 s10 --usb | --sem-fio | --vnc   # força um caminho
@@ -232,22 +234,22 @@ Sempre: `--turn-screen-off --stay-awake`; áudio desligado no caminho USB (`--au
 
 ## Ligar o atheron pelo S10 (Wake-on-LAN)
 
-O S10 fica na mesma LAN do atheron (Wi-Fi `homenet`) e tem tailnet própria, então continua alcançável com o atheron
+O S10 fica na mesma LAN do atheron (o Wi-Fi de casa) e tem tailnet própria, então continua alcançável com o atheron
 parado. `s10 acordar-atheron` (nomad) entra por SSH direto no Termux (nunca pelo atheron), roda `acordar-atheron`
-(pacote mágico por `socat`, 3 rodadas para `192.0.2.255` e `255.255.255.255`, portas 9 e 7) e espera a porta 22
-do atheron na tailnet (`S10_WAKE_WAIT`, padrão 180 s; `S10_ATHERON_ADDR`, padrão `100.64.0.1`).
+(pacote mágico por `socat`, 3 rodadas para o broadcast da LAN e `255.255.255.255`, portas 9 e 7) e espera a porta 22
+do atheron na tailnet (`S10_WAKE_WAIT`, padrão 180 s; `S10_ATHERON_ADDR`, o IP do atheron na tailnet, sem padrão).
 
 ```
 # atheron (root), uma vez: ethtool + regra udev 81-cerberus-wol.rules (WoL "g" no enp2s0f1 a cada boot/hotplug)
 ssh root@atheron 'cat > /usr/local/sbin/cerberus-wol && chmod 755 /usr/local/sbin/cerberus-wol && cerberus-wol' < atheron/wol-atheron.sh
 ssh root@atheron cerberus-wol --check          # --undo desfaz
 # Termux: o bootstrap.sh já instala socat e o acordar-atheron; à mão:
-ssh -p 8022 u0_a999@galaxy-s10 'cat > $PREFIX/bin/acordar-atheron && chmod 700 $PREFIX/bin/acordar-atheron' < termux/acordar-atheron
+ssh -p 8022 <usuario-do-termux>@galaxy-s10 'cat > $PREFIX/bin/acordar-atheron && chmod 700 $PREFIX/bin/acordar-atheron' < termux/acordar-atheron
 # nomad
 s10 acordar-atheron
 ```
 
-Só funciona pelo cabo (`enp2s0f1`, MAC `02:00:00:00:00:aa`); o `/etc/network/interfaces` é gerado pelo cerberus-ia/net,
+Só funciona pelo cabo (`enp2s0f1`, com o MAC dele em `ATHERON_MAC`); o `/etc/network/interfaces` é gerado pelo cerberus-ia/net,
 por isso o WoL fica numa regra udev e não lá. Validado em 17/11/2026: os 12 pacotes chegam no cabo como broadcast
 (captura AF_PACKET) e, **a partir da suspensão (deep/S3)**, o atheron voltou 5 s depois do pacote (`suspend entry`
 22:23:23, `exit` 22:23:50; alarme RTC de segurança em +5 min). Em 18/11/2026, **a partir de desligado (S5,
@@ -257,12 +259,12 @@ o `/proc/acpi/wakeup` declarar só S4 para a `RP09` (porta da placa). O BIOS (In
 com F2, então não há como conferir a opção por lá; não precisa.
 
 **Automático na volta da energia.** O vigia do Termux (`20-guardian.sh`, a cada 60 s) guarda se o `wlan0` tem IP
-da LAN de casa (`192.168.1.x`) em `~/.guardian-wifi`. Na transição caído → conectado (o AP voltou, logo a energia
-voltou), se o atheron não responde ao ping (`192.0.2.10`/`.57`), roda `acordar-atheron` a cada 30 s, até 10 vezes,
+da LAN de casa (prefixo `GUARDIAN_WAKE_SUBNET`) em `~/.guardian-wifi`. Na transição caído → conectado (o AP voltou, logo a energia
+voltou), se o atheron não responde ao ping (`GUARDIAN_ATHERON_IPS`: cabo e Wi-Fi), roda `acordar-atheron` a cada 30 s, até 10 vezes,
 e para quando ele responde. Pacote para máquina ligada não faz nada, então repetir é inofensivo. O reinício do vigia
 não dispara (o estado fica em arquivo). Log em `~/guardian.log` (`auto-wake: ...`, `home Wi-Fi lost/back`).
 Desligar antes de uma manutenção com o atheron desligado de propósito: `touch ~/.acordar-atheron.off` no Termux
-(apagar o arquivo religa). Variáveis `GUARDIAN_WAKE_*`, `GUARDIAN_ATHERON_IPS`.
+(apagar o arquivo religa). Variáveis `GUARDIAN_WAKE_*`, `GUARDIAN_ATHERON_IPS` (ver "Valores do site" abaixo).
 
 Limites: só depois de um desligamento **limpo** pelo Linux (é o driver r8169 que deixa a placa armada; o
 `cerberus-power-guard` desliga assim na falta de energia). Desligado à força (botão segurado) ou com a bateria
@@ -291,7 +293,7 @@ o atheron desligado a USB pode parar de alimentá-lo, e o wake lock gasta a bate
   **Tailscale SSH**: a porta 22 da tailnet no atheron é servida pelo Tailscale SSH, que **ignora** `authorized_keys`, as opções acima e o drop-in. Por isso o shell do `s10tunnel` é o próprio `/usr/local/sbin/cerberus-s10-estado` (registrado em `/etc/shells`; `--undo` volta para `/bin/sh`): qualquer sessão só imprime o `estado.json`, e os túneis `-L` continuam funcionando. As restrições do `authorized_keys` e do drop-in valem para o OpenSSH (por exemplo no IP da LAN).
 - **VNC com senha.** A senha de 8 caracteres (o VNC só usa 8) mora em `/etc/cerberus-s10/vnc-password` (root, 0600, repassada por `LoadCredential`) e a chave de intent em `vnc-access-key`; o guardião as injeta no celular por stdin do `adb shell` (nunca argv/log). No nomad a senha fica em `~/.config/s10/vnc-password` (0600): o tigervnc recebe um arquivo ofuscado (`vncpasswd -f`, 0600, apagado ao sair) e o krdc recebe a senha na área de transferência por 30 s (`wl-copy`, limpa depois). **Prefira o TigerVNC**: no caminho do krdc a senha passa pelo Klipper e pode ficar no histórico dele. Para instalar o `vncviewer`/`vncpasswd` no Bazzite: `brew install tiger-vnc` se a fórmula existir; senão o Flatpak do TigerVNC (`flatpak search tigervnc`) ou uma distrobox. Só documentado, não instalado por este repositório. O servidor escuta só em `lo` e o acesso é pelo túnel SSH do Termux.
 - **Pins de assinatura.** Antes de iniciar o Shizuku ou enviar chave/senha ao droidVNC-NG, o guardião confere o resumo do certificado do pacote (`dumpsys package`) com `/var/lib/cerberus-s10/pins.json` (confiança no primeiro uso). Se mudar, recusa e avisa. O resumo é o `hashCode` que o Android expõe (32 bits), não um SHA-256: protege contra troca acidental e app falso comum, não contra um atacante que gere colisão.
-- **Diálogos por UI.** O dump do `uiautomator` vai para `/data/local/tmp` (do uid shell, não `/sdcard`), é lido com limite de 512 KiB, recusa DTD/entidades e ids duplicados, e os nós têm de ser do pacote certo (`com.android.systemui` para o Wi-Fi, `net.christianbeier.droidvnc_ng` para o botão). O diálogo "Permitir a depuração por Wi-Fi nesta rede?" só é aceito se o SSID atual for **exatamente** `S10_HOME_SSID` (padrão `homenet`, sem comparação por substring) **e** o BSSID for `S10_HOME_BSSID` (padrão `02:00:00:00:00:ab`), ambos lidos de `cmd wifi status`; o texto do diálogo, quando traz o nome da rede, precisa ter uma linha exatamente igual, e o foco é conferido de novo logo antes do toque. O consentimento de MediaProjection **nunca** é tocado (o `appops PROJECT_MEDIA allow` cobre).
+- **Diálogos por UI.** O dump do `uiautomator` vai para `/data/local/tmp` (do uid shell, não `/sdcard`), é lido com limite de 512 KiB, recusa DTD/entidades e ids duplicados, e os nós têm de ser do pacote certo (`com.android.systemui` para o Wi-Fi, `net.christianbeier.droidvnc_ng` para o botão). O diálogo "Permitir a depuração por Wi-Fi nesta rede?" só é aceito se o SSID atual for **exatamente** `S10_HOME_SSID` (sem padrão; sem comparação por substring) **e** o BSSID for `S10_HOME_BSSID` (sem padrão), ambos lidos de `cmd wifi status`; o texto do diálogo, quando traz o nome da rede, precisa ter uma linha exatamente igual, e o foco é conferido de novo logo antes do toque. O consentimento de MediaProjection **nunca** é tocado (o `appops PROJECT_MEDIA allow` cobre).
 - **Passphrase na chave do nomad.** Quem entra no socket do adb tem o shell do celular: proteja `~/.ssh/nomad_ed25519` com passphrase (`ssh-keygen -p -f ~/.ssh/nomad_ed25519`) e deixe o ssh-agent carregá-la. O `s10` usa essa chave em todo ssh (túnel USB, estado, `setup-vnc`, VNC) com `IdentitiesOnly=yes`; `S10_SSH_KEY` troca o caminho.
 - **Chaves adb.** A chave do atheron mora em `/var/lib/cerberus-s10/.android` (0700). Quem a tiver controla o S10: não copie. Para revogar: Opções do desenvolvedor > Revogar autorizações de depuração USB.
 - **sshd do Termux**: só chave (`AuthenticationMethods publickey`), sem root, `AllowUsers` só o usuário do Termux, `MaxAuthTries 2`, `LoginGraceTime 15`, escutando só no IP da tailnet (`ListenAddress`; o vigia do celular tenta de novo até o tun0 subir). `allow-external-apps=false`. Opcional: uma chave extra só para VNC com `permitopen="127.0.0.1:5900"` no `authorized_keys` do Termux.
@@ -304,7 +306,7 @@ O dono optou por **não ter bloqueio de tela** no S10 (a tela quebrada impede di
 - **Sem contas nem segredos no celular**: nada de banco, e-mail, 2FA, gerenciador de senhas ou sessões logadas; só Termux, Tailscale, droidVNC-NG e Shizuku. Se algo sensível precisar existir, não deve ficar logado.
 - **Find My Mobile / apagar remotamente**: mantenha a conta Samsung vinculada para localizar, travar e apagar o aparelho à distância se ele sumir.
 - **Apps mínimos**: desinstale ou desative o resto; sem armazenamento com dados pessoais.
-- **ACL do Tailscale (`tag:s10`, já aplicada)**: o S10 só alcança o DNS do Pi-hole (100.64.0.1:53); os membros da tailnet o alcançam em qualquer porta. Um S10 comprometido não consegue andar pela rede interna.
+- **ACL do Tailscale (`tag:s10`, já aplicada)**: o S10 só alcança o DNS do Pi-hole (o IP do Pi-hole na tailnet, porta 53); os membros da tailnet o alcançam em qualquer porta. Um S10 comprometido não consegue andar pela rede interna.
 - Criptografia de armazenamento continua ligada (padrão). Os segredos do VNC e a chave adb do atheron não ficam no celular.
 
 ## Usos sugeridos
@@ -320,6 +322,18 @@ O dono optou por **não ter bloqueio de tela** no S10 (a tela quebrada impede di
 Os três caminhos e o vigia foram testados no S10 de verdade, com o atheron. `s10 status` mostrou os três ✓ (USB, adb sem fio pela tailnet, VNC pelo túnel do Termux). Tempos de recuperação medidos (detalhes em `docs/testes-de-falha.md`): reinício do S10 — USB 33 s, Tailscale 44 s, sshd do Termux 115 s; Wi-Fi desligado 30 s; Tailscale encerrado 21 s; depuração sem fio desligada 15 s; droidVNC-NG encerrado 20 s; Termux encerrado 19 s.
 Ainda sem teste real: o início do VNC pela intent (com chave e senha), que depende de o dono rodar `--vnc-key`.
 
+## Valores do site (IPs, MAC, SSID, serial)
+
+Nada disso fica no repositório. Cada parte lê de um arquivo **local, não versionado** (`.gitignore`), com um modelo fictício versionado ao lado:
+
+| Parte | Modelo (versionado) | Arquivo real (local) | Onde é instalado |
+|---|---|---|---|
+| atheron | `atheron/s10.env.example` | `atheron/s10.local.env` | o instalador mescla em `/etc/default/cerberus-s10` (só as chaves do arquivo) |
+| nomad | `nomad/s10.conf.example` | `nomad/s10.local.conf` | `install -D -m600 nomad/s10.local.conf ~/.config/s10/config` (ou `S10_CONFIG`) |
+| celular | `termux/s10.conf.example` | `termux/s10.local.conf` | o `bootstrap.sh` grava em `~/.s10.conf` no celular, lido por `boot/20-guardian.sh` e `acordar-atheron` |
+
+As variáveis de ambiente (`S10_*`, `GUARDIAN_*`) têm precedência sobre o arquivo. Sem configuração não há valor padrão real: o serviço do atheron recusa subir sem `S10_TAILNET_IP`, o `bootstrap.sh` exige `S10_TAILNET_IP`, o vigia do celular desliga a checagem de porta e o acordar automático, e o `acordar-atheron` pede o MAC.
+
 ## Licença
 
-Repositório privado, todos os direitos reservados. Veja `LICENSE`.
+[MIT](LICENSE)

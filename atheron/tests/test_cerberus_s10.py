@@ -206,7 +206,7 @@ class PublicSummaryIsolation(unittest.TestCase):
                 f.write("#!/bin/sh\nexit 1\n")
             os.chmod(fake_adb, 0o755)
             estado = os.path.join(d, "estado.json")
-            env = {"S10_ADB": fake_adb, "S10_STATE": estado, "S10_ADB_SOCKET": "",
+            env = {"S10_TAILNET_IP": "100.64.0.10", "S10_ADB": fake_adb, "S10_STATE": estado, "S10_ADB_SOCKET": "",
                    "S10_PUBLIC": os.path.join(d, "missing-dir", "resumo.json")}
             with mock.patch.dict(os.environ, env):
                 self.assertEqual(m.main(["--once"]), 0)
@@ -285,6 +285,8 @@ class AtomicWriter(unittest.TestCase):
 SECRET = "SEKRET-key-0123456789abcdef"  # gitleaks:allow (fake test value)
 SERIAL = "R58M12ABCDE"
 TS_IP = "100.64.0.10"
+TEST_ENV = {"S10_TAILNET_IP": TS_IP, "S10_HOME_SSID": "homenet", "S10_HOME_BSSID": "02:00:00:00:00:ab",
+            "S10_MDNS_SERIAL": "EXAMPLESERIAL"}
 
 
 class GuardParsing(unittest.TestCase):
@@ -584,7 +586,7 @@ PASSWORD = "Zx9Qp2Lm"
 
 
 def make_guardian(phone, probes=None, key=SECRET, pw=PASSWORD, **cfg_over):
-    cfg = m.guard_config({})
+    cfg = m.guard_config(dict(TEST_ENV))
     cfg.update(pins_file=None)
     cfg.update(cfg_over)
     st = {"tcp": {}, "ping": True}
@@ -646,7 +648,7 @@ class GuardianRepairs(unittest.TestCase):
 
     def test_unreadable_is_not_repaired_blindly(self):
         acts = m.plan_repairs({"stay_on": None, "wifi": None, "ports": None, "idle": {}},
-                              m.guard_config({}))
+                              m.guard_config(dict(TEST_ENV)))
         self.assertEqual(acts, [])
 
     def test_secret_never_in_argv_or_logs_or_state(self):
@@ -851,7 +853,7 @@ class GuardianRepairs(unittest.TestCase):
         self.assertTrue(any("repair off" in l for l in g.logs))
 
     def test_tailscale_unresolvable_launcher(self):
-        acts = m.plan_repairs({"ts_alive": False, "ts_activity": None}, m.guard_config({}))
+        acts = m.plan_repairs({"ts_alive": False, "ts_activity": None}, m.guard_config(dict(TEST_ENV)))
         self.assertEqual([a["id"] for a in acts], ["tailscale_unresolved"])
 
 
@@ -985,7 +987,7 @@ class ServerSocket(unittest.TestCase):
         m.collect(run, "adb", server_args=["-L", "localfilesystem:/run/x/adb.sock"])
         self.assertEqual(seen[0], ["adb", "-L", "localfilesystem:/run/x/adb.sock", "start-server"])
         ph = FakePhone()
-        g = m.Guardian(ph, m.guard_config({}), "adb", None, {"tcp": lambda *a, **k: False, "ping": lambda ip: False},
+        g = m.Guardian(ph, m.guard_config(dict(TEST_ENV)), "adb", None, {"tcp": lambda *a, **k: False, "ping": lambda ip: False},
                        logf=lambda x: None, sleep=lambda s: None, server_args=["-L", "localfilesystem:/s"])
         g.recover_adb("ausente", 0)
         g.recover_adb("ausente", 30)
@@ -1052,12 +1054,12 @@ class SsidGate(unittest.TestCase):
         return ph, wrapped
 
     def test_bssid_must_match(self):
-        ph, run = self._dialog_phone(status_fix=lambda t: t.replace("02:00:00:00:00:ab", "aa:bb:cc:dd:ee:ff"))
+        ph, run = self._dialog_phone(status_fix=lambda t: t.replace("02:00:00:00:00:ab", "02:00:00:00:00:ee"))
         g = make_guardian(run)
         cyc(g, 0)
         self.assertEqual(ph.taps, [])
         self.assertTrue(any("not the home network" in l for l in g.logs))
-        ph2, run2 = self._dialog_phone(status_fix=lambda t: t.replace("02:00:00:00:00:ab", "02:00:00:00:00:ab"))
+        ph2, run2 = self._dialog_phone(status_fix=lambda t: t.replace("02:00:00:00:00:ab", "02:00:00:00:00:AB"))
         cyc(make_guardian(run2), 0)
         self.assertTrue(ph2.taps)                      # case-insensitive match of the real BSSID
 
@@ -1395,13 +1397,26 @@ class ProbesIO(unittest.TestCase):
         self.assertFalse(m.ping_probe("1.2.3.4", lambda c, timeout=0: (1, "")))
 
     def test_config_defaults_and_credentials(self):
-        c = m.guard_config({})
+        c = m.guard_config(dict(TEST_ENV))
         self.assertEqual((c["tailnet_ip"], c["ssh_port"], c["vnc_port"], c["vnc_iface"]),
                          ("100.64.0.10", 8022, 5900, "lo"))
         self.assertEqual(c["key_file"], "/etc/cerberus-s10/vnc-access-key")
         c = m.guard_config({"CREDENTIALS_DIRECTORY": "/run/credentials/x", "S10_REPAIR": "0"})
         self.assertEqual(c["key_file"], "/run/credentials/x/vnc-access-key")
         self.assertFalse(c["repair"])
+
+    def test_site_values_have_no_real_default(self):
+        c = m.guard_config({})
+        self.assertEqual((c["tailnet_ip"], c["home_ssid"], c["home_bssid"], c["mdns_serial"]), ("", "", "", ""))
+
+    def test_main_refuses_without_tailnet_ip(self):
+        old = dict(os.environ)
+        try:
+            os.environ.pop("S10_TAILNET_IP", None)
+            self.assertEqual(m.main(["--once"]), 2)
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
 
     def test_default_run_passes_stdin(self):
         rc, out = m.default_run(["cat"], input_text="olá")

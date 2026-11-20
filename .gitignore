@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 *.pub
 !termux/authorized_keys.example
+
+# site values and local notes (real IPs/MACs/serials); only the *.example files are versioned
+atheron/s10.local.env
+nomad/s10.local.conf
+termux/s10.local.conf
+CLAUDE.local.md

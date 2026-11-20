@@ -1,19 +1,24 @@
 #!/data/data/com.termux/files/usr/bin/sh
 # acordar-atheron: manda o pacote mágico de Wake-on-LAN para o cabo do atheron (o S10 está na mesma LAN).
-# Uso: acordar-atheron [MAC] [BROADCAST]      (padrões: ATHERON_MAC / ATHERON_BCAST ou os valores abaixo)
+# Uso: acordar-atheron [MAC] [BROADCAST]      (padrões: ATHERON_MAC / ATHERON_BCAST do ambiente ou do ~/.s10.conf,
+#                                              gravado pelo bootstrap.sh; sem MAC é erro)
 #      acordar-atheron --dump [MAC]           (escreve o pacote em stdout, sem enviar: para testes)
 # Envia 3 vezes para o broadcast da LAN e para 255.255.255.255, portas 9 e 7 (UDP; não precisa de root).
 # Requer: pkg install socat
 set -eu
 
-DEFAULT_MAC=02:00:00:00:00:aa      # enp2s0f1 do atheron
-DEFAULT_BCAST=192.0.2.255
+# Valores do site: ambiente ou arquivo de configuração do bootstrap (linhas CHAVE=valor, lidas como dados).
+CONF=${S10_CONF:-${HOME:-/data/data/com.termux/files/home}/.s10.conf}
+conf() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | head -n 1; }
+DEFAULT_MAC=$(conf ATHERON_MAC)          # MAC da placa de cabo do atheron
+DEFAULT_BCAST=$(conf ATHERON_BCAST)
 
 DUMP=0
 if [ "${1:-}" = "--dump" ]; then DUMP=1; shift; fi
 MAC=${1:-${ATHERON_MAC:-$DEFAULT_MAC}}
 BCAST=${2:-${ATHERON_BCAST:-$DEFAULT_BCAST}}
 
+[ -n "$MAC" ] || { echo "MAC do atheron não configurado (ATHERON_MAC em $CONF, ou passe o MAC como argumento)" >&2; exit 2; }
 HEX=$(printf '%s' "$MAC" | tr -d ':-' | tr 'A-F' 'a-f')
 case "$HEX" in
 *[!0-9a-f]*) echo "MAC inválido: $MAC" >&2; exit 2 ;;
@@ -38,6 +43,7 @@ if [ "$DUMP" -eq 1 ]; then
     exit 0
 fi
 
+[ -n "$BCAST" ] || { echo "broadcast da LAN não configurado (ATHERON_BCAST em $CONF, ou passe como 2º argumento)" >&2; exit 2; }
 command -v socat >/dev/null 2>&1 || { echo "socat ausente: pkg install socat" >&2; exit 1; }
 sent=0
 for round in 1 2 3; do

@@ -18,7 +18,12 @@ fail=0 n=0
 ok() { n=$((n + 1)); if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=$((fail + 1)); fi; }
 
 printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest nomad\n' > "$T/keys.pub"
+# without any site value the bootstrap refuses (no real default exists), before touching sshd_config
 sh "$HERE/../bootstrap.sh" "$T/keys.pub" > "$T/out" 2>&1; rc=$?
+ok "bootstrap without tailnet IP fails clearly" "[ $rc -ne 0 ] && grep -q 'S10_TAILNET_IP' '$T/out' && [ ! -e '$HOME/.s10.conf' ]"
+printf 'S10_TAILNET_IP=100.64.0.10\nGUARDIAN_WAKE_SUBNET=192.0.2.\nGUARDIAN_ATHERON_IPS=192.0.2.10 192.0.2.11\nATHERON_MAC=02:00:00:00:00:aa\nATHERON_BCAST=192.0.2.255\n' > "$T/site.conf"
+S10_CONF_SRC="$T/site.conf" sh "$HERE/../bootstrap.sh" "$T/keys.pub" > "$T/out" 2>&1; rc=$?
+ok "config written to ~/.s10.conf, 0600" "cmp -s '$T/site.conf' '$HOME/.s10.conf' && [ \"\$(stat -c %a '$HOME/.s10.conf')\" = 600 ]"
 ok "bootstrap exits 0" "[ $rc -eq 0 ]"
 ok "allow-external-apps false" "grep -qx 'allow-external-apps=false' '$HOME/.termux/termux.properties'"
 ok "settings reloaded" "grep -q 'termux-reload-settings' '$LOG_CALLS'"
@@ -56,6 +61,16 @@ ok "user lines kept after migration" "grep -qx 'alias ll=\"ls -l\"' '$HOME/.bash
 sh "$HERE/../bootstrap.sh" /nonexistent > "$T/out" 2>&1; rc=$?
 ok "missing keys file rejected" "[ $rc -ne 0 ]"
 
+# site values: read from ~/.s10.conf (data, not executed); GUARDIAN_* env wins; nothing real by default
+ok "acordar-atheron: MAC and broadcast from ~/.s10.conf" "[ \"\$(sh '$HERE/../acordar-atheron' --dump | od -An -tx1 | tr -d ' \n' | tail -c 12)\" = 0200000000aa ]"
+ok "acordar-atheron: argument wins over the file" "[ \"\$(sh '$HERE/../acordar-atheron' --dump 02:00:00:00:00:bb | od -An -tx1 | tr -d ' \n' | tail -c 12)\" = 0200000000bb ]"
+ok "acordar-atheron: no MAC configured is an error" "S10_CONF='$T/none' sh '$HERE/../acordar-atheron' --dump > '$T/o' 2>&1; [ \$? -eq 2 ] && grep -q 'não configurado' '$T/o'"
+ok "acordar-atheron: no broadcast configured is an error" "printf 'ATHERON_MAC=02:00:00:00:00:aa\n' > '$T/mac.conf'; S10_CONF='$T/mac.conf' sh '$HERE/../acordar-atheron' > '$T/o' 2>&1; [ \$? -eq 2 ] && grep -q 'broadcast' '$T/o'"
+# guardian: tailnet address falls back to ~/.s10.conf when sshd_config has no ListenAddress
+touch "$T/sshd.up"; rm -f "$T/g.pid"; : > "$T/g.log"
+PREFIX="$T/nopfx" GUARDIAN_ONCE=1 GUARDIAN_LOG="$T/g.log" GUARDIAN_PID="$T/g.pid" GUARDIAN_PORT_CHECK=false sh "$HERE/../boot/20-guardian.sh"
+ok "guardian takes the tailnet address from the config file" "grep -q 'not answering on 100.64.0.10' '$T/g.log'"
+rm -f "$T/sshd.up" "$T/g.pid"
 # guardian: sshd down -> restart + log; sshd up -> nothing
 : > "$LOG_CALLS"
 export GUARDIAN_ONCE=1 GUARDIAN_LOG=$T/g.log GUARDIAN_PID=$T/g.pid
