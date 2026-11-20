@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The monitor runs on Python 3.13 with the standard library only.
+      - name: Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      # umask 022: the tests create files and some checks look at the mode bits.
+      - name: Tests
+        run: |
+          umask 022
+          python3 -I atheron/tests/test_cerberus_s10.py
+          bash termux/tests/test_termux.sh
+          bash atheron/tests/test_installer.sh
+          bash nomad/tests/test_s10.sh
+          bash atheron/tests/test_wol.sh
+
+      - name: Shellcheck
+        run: |
+          shellcheck -S warning atheron/user-step-s10.sh atheron/wol-atheron.sh atheron/tests/test_wol.sh nomad/s10 nomad/tests/test_s10.sh termux/tests/test_termux.sh atheron/tests/test_installer.sh
+          shellcheck -S warning -s sh termux/bootstrap.sh termux/boot/*.sh termux/acordar-atheron
