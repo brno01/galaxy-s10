@@ -4,6 +4,7 @@
 #       sh bootstrap.sh --remove-key <comentario>     (tira uma chave do authorized_keys)
 # Como chegar aqui (sem teclado no S10): no atheron/nomad, com o S10 via adb/scrcpy:
 #   adb push termux/bootstrap.sh termux/boot/10-sshd.sh termux/boot/20-guardian.sh /sdcard/Download/
+#   adb push termux/s10.local.conf /sdcard/Download/    # valores do site (modelo: termux/s10.conf.example); fica em ~/.s10.conf
 #   adb push minhas-chaves.pub /sdcard/Download/s10-keys.pub
 #   (no Termux, via scrcpy)  termux-setup-storage   # uma vez, aceita a permissão
 #   sh ~/storage/downloads/bootstrap.sh ~/storage/downloads/s10-keys.pub
@@ -60,7 +61,17 @@ set_opt KbdInteractiveAuthentication no
 set_opt PermitRootLogin no
 # endurecimento: só a interface da tailnet (o 20-guardian.sh reinicia o sshd até o tun0 existir), só este usuário,
 # só chave pública, poucas tentativas
-TAILNET_IP=${S10_TAILNET_IP:-100.64.0.10}
+# valores do site: S10_CONF_SRC, ou s10.local.conf ao lado do script; gravado em ~/.s10.conf (0600),
+# que o 20-guardian.sh e o acordar-atheron leem. Sem arquivo novo, o ~/.s10.conf anterior continua valendo.
+S10_CONF_FILE=$HOME/.s10.conf
+CONF_SRC=${S10_CONF_SRC:-$(first_file "$SELF/s10.local.conf" || true)}
+if [ -n "$CONF_SRC" ] && [ -f "$CONF_SRC" ]; then
+    cp "$CONF_SRC" "$S10_CONF_FILE.tmp"
+    chmod 600 "$S10_CONF_FILE.tmp"
+    mv -f "$S10_CONF_FILE.tmp" "$S10_CONF_FILE"
+fi
+TAILNET_IP=${S10_TAILNET_IP:-$(sed -n 's/^S10_TAILNET_IP=//p' "$S10_CONF_FILE" 2>/dev/null | head -n 1 || true)}
+[ -n "$TAILNET_IP" ] || { echo "IP do celular na tailnet não definido: use S10_TAILNET_IP=<ip> ou s10.local.conf (modelo: s10.conf.example)"; exit 1; }
 set_opt ListenAddress "$TAILNET_IP"
 set_opt AllowUsers "$(whoami)"
 set_opt MaxAuthTries 2

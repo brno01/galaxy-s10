@@ -676,7 +676,7 @@ def ping_probe(ip, run=None):
 
 def guard_config(env):
     return {
-        "tailnet_ip": env.get("S10_TAILNET_IP", "100.64.0.10"),
+        "tailnet_ip": env.get("S10_TAILNET_IP", ""),
         "ts_probe": env.get("S10_TS_PROBE", "ping"),       # ping | off
         "ssh_port": int(env.get("S10_SSH_PORT", "8022")),
         "vnc_port": int(env.get("S10_VNC_PORT", "5900")),
@@ -685,14 +685,14 @@ def guard_config(env):
             env.get("CREDENTIALS_DIRECTORY", "/etc/cerberus-s10"), "vnc-access-key"),
         "pass_file": env.get("S10_VNC_PASSWORD_FILE") or os.path.join(
             env.get("CREDENTIALS_DIRECTORY", "/etc/cerberus-s10"), "vnc-password"),
-        "home_ssid": env.get("S10_HOME_SSID", "homenet"),
-        "home_bssid": env.get("S10_HOME_BSSID", "02:00:00:00:00:ab").lower(),
+        "home_ssid": env.get("S10_HOME_SSID", ""),
+        "home_bssid": env.get("S10_HOME_BSSID", "").lower(),
         "allow_unprotected": env.get("S10_ALLOW_UNPROTECTED_VNC", "0") == "1",
         "pins_file": env.get("S10_PINS", "/var/lib/cerberus-s10/pins.json"),
         "repair": env.get("S10_REPAIR", "1") != "0",
         "cooldown_s": float(env.get("S10_COOLDOWN", "120")),
         "wifi_iface": env.get("S10_WIFI_IFACE", "wlan0"),
-        "mdns_serial": env.get("S10_MDNS_SERIAL", "EXAMPLESERIAL"),
+        "mdns_serial": env.get("S10_MDNS_SERIAL", ""),
         "regen_cooldown_s": float(env.get("S10_REGEN_COOLDOWN", "600")),
         "ui_cooldown_s": float(env.get("S10_UI_COOLDOWN", "180")),
         "stick_s": float(env.get("S10_STICK_WAIT", "3")),   # wait before checking a re-enable stuck
@@ -1127,7 +1127,12 @@ def main(argv=None):
     server_args = ["-L", "localfilesystem:" + sock] if sock else []
     if sock:
         os.environ["ADB_SERVER_SOCKET"] = "localfilesystem:" + sock   # every adb client below talks to it
-    guardian = Guardian(default_run, guard_config(env), adb, serial, logf=lambda m: log(m),
+    cfg = guard_config(env)
+    if not cfg["tailnet_ip"]:
+        log("S10_TAILNET_IP is not set: copy atheron/s10.env.example to /etc/default/cerberus-s10 "
+            "(the installer does it from atheron/s10.local.env) and fill in the real values")
+        return 2
+    guardian = Guardian(default_run, cfg, adb, serial, logf=lambda m: log(m),
                         server_args=server_args)
     try:
         with open(path) as f:

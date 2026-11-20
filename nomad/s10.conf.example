@@ -1,0 +1,13 @@
+# Valores do site para o wrapper `s10` (linhas CHAVE=valor, sem aspas; o ambiente S10_* vence o arquivo).
+# Copie para nomad/s10.local.conf (ignorado pelo git), preencha e instale:
+#   install -D -m600 nomad/s10.local.conf ~/.config/s10/config
+# Valores abaixo são de documentação; troque pelos reais.
+
+# IP do celular na tailnet
+S10_TAILNET_IP=100.64.0.10
+# Usuário do Termux no celular (resultado de `whoami` lá)
+S10_TERMUX_USER=u0_a999
+# Serial do S10 no USB do atheron (preferido se estiver na lista de aparelhos)
+S10_DEFAULT_SERIAL=EXAMPLESERIAL
+# IP do atheron na tailnet (usado só por `s10 acordar-atheron`, para esperar a máquina responder)
+S10_ATHERON_ADDR=100.64.0.1

@@ -20,11 +20,9 @@ Environment=S10_STATE=/run/cerberus-s10/estado.json
 # adb server on a unix socket (no TCP :5037); the group cerberus-s10 (tunnel user) may connect
 Environment=S10_ADB_SOCKET=/run/cerberus-s10/adb.sock
 Environment=S10_PINS=/var/lib/cerberus-s10/pins.json
-Environment=S10_HOME_SSID=homenet
-Environment=S10_HOME_BSSID=02:00:00:00:00:ab
 Environment=S10_INTERVAL=30
-# guardian: tailnet ip of the phone (ping + ssh banner probes), see README
-Environment=S10_TAILNET_IP=100.64.0.10
+# Site values (S10_TAILNET_IP, S10_HOME_SSID, S10_HOME_BSSID, S10_MDNS_SERIAL) live in /etc/default/cerberus-s10
+# (below), installed from atheron/s10.local.env; see atheron/s10.env.example. S10_TAILNET_IP is required.
 # optional overrides: S10_SERIAL, S10_TEMP_MAX, S10_FULL_HOURS, S10_ADB, S10_INTERVAL, S10_TAILNET_IP,
 # S10_TS_PROBE (ping|off), S10_HOME_SSID, S10_SSH_PORT, S10_VNC_PORT, S10_VNC_IFACE, S10_REPAIR=0 (observe only), S10_COOLDOWN
 EnvironmentFile=-/etc/default/cerberus-s10

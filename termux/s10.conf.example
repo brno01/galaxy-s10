@@ -1,0 +1,15 @@
+# Valores do site do celular (linhas CHAVE=valor, sem aspas; lidas como dados, nunca executadas).
+# Copie para termux/s10.local.conf (ignorado pelo git), preencha e envie junto do bootstrap
+# (adb push termux/s10.local.conf /sdcard/Download/). O bootstrap.sh grava em ~/.s10.conf no celular;
+# o 20-guardian.sh e o acordar-atheron leem de lá. As variáveis GUARDIAN_* do ambiente têm precedência.
+# Valores abaixo são de documentação; troque pelos reais.
+
+# IP do celular na tailnet (ListenAddress do sshd e alvo da checagem de porta do vigia)
+S10_TAILNET_IP=100.64.0.10
+# Prefixo IPv4 da LAN de casa na wlan0 (vazio = sem acordar o atheron automático)
+GUARDIAN_WAKE_SUBNET=192.0.2.
+# IPs do atheron na LAN (cabo e Wi-Fi), separados por espaço: o vigia pinga para saber se ele já acordou
+GUARDIAN_ATHERON_IPS=192.0.2.10 192.0.2.11
+# MAC da placa de cabo do atheron (Wake-on-LAN) e o broadcast da LAN
+ATHERON_MAC=02:00:00:00:00:01
+ATHERON_BCAST=192.0.2.255
