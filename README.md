@@ -1,5 +1,8 @@
 # Galaxy S10 como nó do Cerberus
 
+[![ci](https://github.com/brno01/galaxy-s10/actions/workflows/ci.yml/badge.svg)](https://github.com/brno01/galaxy-s10/actions/workflows/ci.yml)
+[![security](https://github.com/brno01/galaxy-s10/actions/workflows/security.yml/badge.svg)](https://github.com/brno01/galaxy-s10/actions/workflows/security.yml)
+
 Um Samsung Galaxy S10 (Exynos, Android 12 / One UI 4) com a tela quebrada vira um nó do homelab. Ele fica ligado na USB do **atheron** 24 h por dia, roda **Termux** (sshd na 8022, só chave) e o app **Tailscale**. Do **nomad** você o controla pelo scrcpy com baixa latência, através de um túnel SSH até o adb do atheron.
 
 ## Arquitetura
@@ -27,15 +30,21 @@ O adb do atheron **não tem listener TCP** (nem 5037): só o socket unix `/run/c
 | `docs/` | `testes-de-falha.md` (drills de recuperação) |
 | `nomad/` | `s10` (wrapper com 3 caminhos e `status`), `s10.desktop`, testes |
 
-Testes e lint (nada disso toca em aparelho):
+## Testes e CI
+
+Nada disto toca em aparelho nem em serviço (os testes usam adb, ssh e scrcpy falsos). O workflow `ci` roda exatamente estes comandos em cada pull request e em cada push no `master`:
 
 ```
 python3 -I atheron/tests/test_cerberus_s10.py
-bash nomad/tests/test_s10.sh
 bash termux/tests/test_termux.sh
-shellcheck atheron/user-step-s10.sh nomad/s10 nomad/tests/test_s10.sh termux/tests/test_termux.sh
-shellcheck -s sh termux/bootstrap.sh termux/boot/10-sshd.sh termux/boot/20-guardian.sh
+bash atheron/tests/test_installer.sh
+bash nomad/tests/test_s10.sh
+bash atheron/tests/test_wol.sh
+shellcheck -S warning atheron/user-step-s10.sh atheron/wol-atheron.sh atheron/tests/test_wol.sh nomad/s10 nomad/tests/test_s10.sh termux/tests/test_termux.sh atheron/tests/test_installer.sh
+shellcheck -S warning -s sh termux/bootstrap.sh termux/boot/*.sh termux/acordar-atheron
 ```
+
+O workflow `security` procura segredos no histórico (gitleaks), dependências vulneráveis (osv-scanner), erros de código (semgrep) e problemas em scripts e workflows (shellcheck, actionlint, zizmor); roda em pull requests, no `master` e toda semana. O workflow `claude` responde a menções `@claude` em issues e pull requests, só para o dono do repositório. Os três usam Actions fixadas por SHA.
 
 ## Arquitetura redundante
 
@@ -310,3 +319,7 @@ O dono optou por **não ter bloqueio de tela** no S10 (a tela quebrada impede di
 
 Os três caminhos e o vigia foram testados no S10 de verdade, com o atheron. `s10 status` mostrou os três ✓ (USB, adb sem fio pela tailnet, VNC pelo túnel do Termux). Tempos de recuperação medidos (detalhes em `docs/testes-de-falha.md`): reinício do S10 — USB 33 s, Tailscale 44 s, sshd do Termux 115 s; Wi-Fi desligado 30 s; Tailscale encerrado 21 s; depuração sem fio desligada 15 s; droidVNC-NG encerrado 20 s; Termux encerrado 19 s.
 Ainda sem teste real: o início do VNC pela intent (com chave e senha), que depende de o dono rodar `--vnc-key`.
+
+## Licença
+
+Repositório privado, todos os direitos reservados. Veja `LICENSE`.
