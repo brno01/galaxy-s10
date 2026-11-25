@@ -37,7 +37,7 @@ jobs:
           umask 022
           python3 -I atheron/tests/test_cerberus_s10.py
           bash termux/tests/test_termux.sh
-          bash atheron/tests/test_installer.sh windows/s10-dev.sh
+          bash atheron/tests/test_installer.sh
           bash nomad/tests/test_s10.sh
           bash atheron/tests/test_wol.sh
           bash atheron/tests/test_s10_dev.sh
