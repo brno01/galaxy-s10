@@ -232,6 +232,7 @@ def collect(run, adb="adb", serial=None, now=None, server_args=()):
 
 # ---------------------------------------------------------------- guardian: parsing (pure)
 PKG_TAILSCALE = "com.tailscale.ipn"
+PHANTOM_MAX = "2147483647"   # Integer.MAX_VALUE: no phantom process limit
 PKG_TERMUX = "com.termux"
 PKG_TERMUX_BOOT = "com.termux.boot"
 PKG_VNC = "net.christianbeier.droidvnc_ng"
@@ -517,6 +518,12 @@ def plan_repairs(obs, cfg):
     if obs.get("stay_on") is not None and obs["stay_on"] != "7":
         act("stay_on", "stay_on_while_plugged_in=%r -> 7" % obs["stay_on"],
             [["settings", "put", "global", "stay_on_while_plugged_in", "7"]])
+    # Android 12 kills "phantom" processes (children of apps, e.g. Termux/proot) beyond 32: VS Code Remote-SSH in
+    # the proot Debian spawns many. The sync must stay disabled or a server-side config push resets the limit.
+    if obs.get("phantom") is not None and obs["phantom"] != PHANTOM_MAX:
+        act("phantom_procs", "max_phantom_processes=%r -> %s" % (obs["phantom"], PHANTOM_MAX),
+            [["device_config", "set_sync_disabled_for_tests", "persistent"],
+             ["device_config", "put", "activity_manager", "max_phantom_processes", PHANTOM_MAX]])
     if obs.get("wifi") is False:
         act("wifi", "Wi-Fi disabled -> svc wifi enable", [["svc", "wifi", "enable"]])
     if obs.get("adb_wifi") is not None and obs["adb_wifi"] != "1":
@@ -766,6 +773,8 @@ class Guardian:
             "a11y_services": setting("secure", "enabled_accessibility_services"),
             "a11y_enabled": setting("secure", "accessibility_enabled"),
         }
+        out = get(["device_config", "get", "activity_manager", "max_phantom_processes"])
+        obs["phantom"] = None if out is None else parse_setting(out)
         out = get(["cmd", "wifi", "status"])
         obs["wifi"] = None if out is None else parse_wifi_status(out)
         # pidof exits 1 when not running, so only rc 0/1 with empty output counts as "not alive"

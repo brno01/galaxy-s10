@@ -438,11 +438,14 @@ class FakePhone:
                       "android.permission.READ_EXTERNAL_STORAGE": False}
         self.vnc_works = True
         self.sshd_works = True
+        self.phantom = "null"        # device_config activity_manager max_phantom_processes (unset)
+        self.sync_disabled = False
 
     def writes(self):
         return [c for c in self.calls
                 if c[:2] == ["settings", "put"] or c[:2] == ["svc", "wifi"] or c[:1] == ["am"]
-                or c[:3] == ["dumpsys", "deviceidle", "whitelist"] and len(c) > 3 or c[:2] == ["appops", "set"]]
+                or c[:3] == ["dumpsys", "deviceidle", "whitelist"] and len(c) > 3 or c[:2] == ["appops", "set"]
+                or c[:1] == ["device_config"] and c[1] != "get"]
 
     def __call__(self, cmd, input_text=None, timeout=15):
         if cmd[0] == "avahi-browse":
@@ -476,6 +479,14 @@ class FakePhone:
             return 0, fx("cmd_wifi_status_on.txt" if self.wifi else "cmd_wifi_status_off.txt")
         if a[:2] == ["svc", "wifi"]:
             self.wifi = True
+            return 0, ""
+        if a[:3] == ["device_config", "get", "activity_manager"]:
+            return 0, self.phantom + "\n"
+        if a[:2] == ["device_config", "set_sync_disabled_for_tests"]:
+            self.sync_disabled = a[2] == "persistent"
+            return 0, ""
+        if a[:3] == ["device_config", "put", "activity_manager"]:
+            self.phantom = a[4]
             return 0, ""
         if a[0] == "pidof":
             return (0, "4321\n") if self.ts else (1, "")
@@ -617,13 +628,15 @@ class GuardianRepairs(unittest.TestCase):
         for want in ("stay_on", "wifi", "adb_wifi", "vpn_app", "vpn_lockdown", "tailscale_start",
                      "idle_com.tailscale.ipn", "idle_com.termux.boot", "idle_net.christianbeier.droidvnc_ng",
                      "projection", "a11y_service", "a11y_enabled", "vnc_start", "termux_start", "shizuku",
-                     "grant_WRITE_EXTERNAL_STORAGE", "grant_READ_EXTERNAL_STORAGE"):
+                     "grant_WRITE_EXTERNAL_STORAGE", "grant_READ_EXTERNAL_STORAGE", "phantom_procs"):
             self.assertIn(want, ids)
         self.assertNotIn("idle_com.termux", ids)   # already whitelisted: no write
         self.assertEqual(ph.s[("global", "stay_on_while_plugged_in")], "7")
         self.assertEqual(ph.s[("secure", "always_on_vpn_app")], "com.tailscale.ipn")
         self.assertEqual(ph.s[("secure", "always_on_vpn_lockdown")], "0")
         self.assertEqual(ph.s[("global", "adb_wifi_enabled")], "1")
+        self.assertEqual(ph.phantom, "2147483647")
+        self.assertTrue(ph.sync_disabled)   # otherwise a server-side config sync resets the limit
         ph.calls.clear()
         _, lines = cyc(g, 30)
         self.assertEqual([l for l in lines if l.startswith("REPAIR")], [])
@@ -645,6 +658,14 @@ class GuardianRepairs(unittest.TestCase):
         self.assertNotIn("stay_on", ids)
         self.assertNotIn("wifi", ids)
         self.assertIn("adb_wifi", ids)
+
+    def test_phantom_limit_only_on_drift(self):
+        cfg = m.guard_config(dict(TEST_ENV))
+        ids = lambda v: [a["id"] for a in m.plan_repairs({"phantom": v, "idle": {}}, cfg)]
+        self.assertEqual(ids("2147483647"), [])
+        self.assertEqual(ids(None), [])          # unreadable: never written blindly
+        self.assertEqual(ids(""), ["phantom_procs"])        # unset ("null")
+        self.assertEqual(ids("32"), ["phantom_procs"])
 
     def test_unreadable_is_not_repaired_blindly(self):
         acts = m.plan_repairs({"stay_on": None, "wifi": None, "ports": None, "idle": {}},

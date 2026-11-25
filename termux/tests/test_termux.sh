@@ -141,5 +141,56 @@ sh "$HERE/../bootstrap.sh" --remove-key > /dev/null 2>&1; rc=$?
 ok "remove-key without a comment fails" "[ $rc -ne 0 ]"
 ok "example has no atheron key" "! grep -v '^#' '$HERE/../authorized_keys.example' | grep -q atheron"
 
+# dev-setup.sh: proot Debian + chave s10-dev com comando forçado
+# shellcheck disable=SC2016  # fake proot-distro is generated with literal $LOG_CALLS/$PREFIX
+# installed = "$T/distro-<name>" exists; login fails before install (like proot-distro 5.x)
+printf '#!/bin/sh\necho "proot-distro $*" >> "$LOG_CALLS"\ncase "$1" in\nreset) echo "Error: container $2 has no OCI manifest."; exit 1 ;;\nremove) rm -f "%s/distro-$2.broken" "%s/distro-$2" ;;\ninstall) [ "$2" = "${FAKE_PD_FAIL_IMAGE:-}" ] && { echo "Unauthorized"; exit 1; }; [ -e "%s/distro-$4" ] && { echo "Error: container already exists"; exit 1; }; touch "%s/distro-$4" ;;\nlogin) [ -e "%s/distro-$2.broken" ] && { echo "Error: lock held"; exit 1; }; [ -e "%s/distro-$2" ] || { echo "Error: container $2 is not installed."; exit 1; } ;;\nesac\nexit 0\n' "$T" "$T" "$T" "$T" "$T" "$T" > "$T/bin/proot-distro"
+chmod +x "$T/bin/proot-distro"
+DEVKEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIdevkey nomad-s10-dev'
+printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAInomadkey nomad\n' > "$HOME/.ssh/authorized_keys"
+: > "$LOG_CALLS"
+sh "$HERE/../dev-setup.sh" > "$T/out" 2>&1; rc=$?
+ok "dev-setup without a key fails" "[ $rc -ne 0 ] && ! grep -q proot-distro '$LOG_CALLS'"
+sh "$HERE/../dev-setup.sh" 'command="sh" ssh-ed25519 AAAA' > "$T/out" 2>&1; rc=$?
+ok "dev-setup refuses options in the key" "[ $rc -ne 0 ] && ! grep -q 'command=\"sh\"' '$HOME/.ssh/authorized_keys'"
+sh "$HERE/../dev-setup.sh" "$DEVKEY" > "$T/out" 2>&1; rc=$?
+ok "dev-setup exits 0" "[ $rc -eq 0 ]"
+ok "dev-setup installs proot-distro and debian (AWS mirror, named debian)" "grep -q '^pkg install -y proot-distro' '$LOG_CALLS' && grep -qx 'proot-distro install public.ecr.aws/docker/library/debian:trixie --name debian' '$LOG_CALLS'"
+ok "dev-setup installs guest packages" "grep -q '^proot-distro login debian -- /bin/sh -c .*apt-get install -y --no-install-recommends .*git' '$LOG_CALLS'"
+ok "s10-dev-shell installed 0700" "[ \"\$(stat -c %a '$PREFIX/bin/s10-dev-shell')\" = 700 ] && cmp -s '$HERE/../s10-dev-shell' '$PREFIX/bin/s10-dev-shell'"
+ok "dev key restricted with forced command" "grep -qxF 'restrict,port-forwarding,pty,command=\"$PREFIX/bin/s10-dev-shell\" $DEVKEY' '$HOME/.ssh/authorized_keys'"
+ok "plain nomad key untouched" "grep -qx 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAInomadkey nomad' '$HOME/.ssh/authorized_keys'"
+: > "$LOG_CALLS"
+sh "$HERE/../dev-setup.sh" "$DEVKEY" > "$T/out" 2>&1
+ok "dev-setup idempotent: no reinstall, one key line" "! grep -q 'proot-distro install' '$LOG_CALLS' && [ \$(grep -c 'AAAAIdevkey' '$HOME/.ssh/authorized_keys') -eq 1 ] && [ \$(wc -l < '$HOME/.ssh/authorized_keys') -eq 2 ]"
+printf '%s\n' "$DEVKEY" >> "$HOME/.ssh/authorized_keys"   # an unrestricted copy of the dev key gets replaced
+sh "$HERE/../dev-setup.sh" "$DEVKEY" > "$T/out" 2>&1
+ok "unrestricted copy of the dev key replaced" "! grep -qx '$DEVKEY' '$HOME/.ssh/authorized_keys' && [ \$(grep -c 'AAAAIdevkey' '$HOME/.ssh/authorized_keys') -eq 1 ]"
+# Debian installed by an earlier run / another proot-distro layout: no install attempt (it would fail "already exists")
+rm -f "$PREFIX/bin/s10-dev-shell"; : > "$LOG_CALLS"
+sh "$HERE/../dev-setup.sh" "$DEVKEY" > "$T/out" 2>&1; rc=$?
+ok "existing Debian detected by login, not by path" "[ $rc -eq 0 ] && ! grep -q 'proot-distro install' '$LOG_CALLS' && grep -q 'login debian -- /bin/true' '$LOG_CALLS'"
+# first image refused (Docker Hub "Unauthorized"): falls back to the second
+rm -f "$T"/distro-debian*; : > "$LOG_CALLS"
+FAKE_PD_FAIL_IMAGE=public.ecr.aws/docker/library/debian:trixie sh "$HERE/../dev-setup.sh" "$DEVKEY" > "$T/out" 2>&1; rc=$?
+ok "image refused: falls back to the other registry" "[ $rc -eq 0 ] && grep -qx 'proot-distro install debian:trixie --name debian' '$LOG_CALLS'"
+touch "$T/distro-debian.broken"; : > "$LOG_CALLS"
+sh "$HERE/../dev-setup.sh" "$DEVKEY" > "$T/out" 2>&1; rc=$?
+ok "login error other than not-installed: shown, no reinstall" "[ $rc -eq 3 ] && grep -q 'lock held' '$T/out' && ! grep -q 'proot-distro install' '$LOG_CALLS'"
+: > "$LOG_CALLS"
+S10_DEV_RESET=1 sh "$HERE/../dev-setup.sh" "$DEVKEY" > "$T/out" 2>&1; rc=$?
+ok "S10_DEV_RESET=1 removes and reinstalls a broken container" "[ $rc -eq 0 ] && grep -qx 'proot-distro remove debian' '$LOG_CALLS' && grep -q '^proot-distro install .* --name debian$' '$LOG_CALLS' && ! grep -q 'proot-distro reset' '$LOG_CALLS'"
+rm -f "$T/distro-debian.broken"
+rm -f "$PREFIX/bin/s10-dev-shell"
+sh -s -- "$DEVKEY" < "$HERE/../dev-setup.sh" > "$T/out" 2>&1; rc=$?
+ok "dev-setup through sh -s writes the embedded wrapper" "[ $rc -eq 0 ] && grep -q 'proot-distro login \"\$DISTRO\" -- /bin/bash -lc \"\$SSH_ORIGINAL_COMMAND\"' '$PREFIX/bin/s10-dev-shell'"
+# s10-dev-shell: the client command goes into the guest, an empty one opens a login shell
+: > "$LOG_CALLS"
+SSH_ORIGINAL_COMMAND='echo hi' sh "$HERE/../s10-dev-shell"
+ok "s10-dev-shell runs the command in the guest" "grep -qx 'proot-distro login debian -- /bin/bash -lc echo hi' '$LOG_CALLS'"
+: > "$LOG_CALLS"
+SSH_ORIGINAL_COMMAND='' sh "$HERE/../s10-dev-shell"
+ok "s10-dev-shell without command opens a shell" "grep -qx 'proot-distro login debian' '$LOG_CALLS'"
+
 echo "--- $n checks, $fail failed"
 [ "$fail" -eq 0 ]
