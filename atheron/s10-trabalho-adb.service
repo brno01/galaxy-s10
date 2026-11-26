@@ -1,0 +1,52 @@
+[Unit]
+Description=S10: adb broker for the work account (time-boxed window, see galaxy-s10 README "Conta de trabalho")
+After=cerberus-s10.service
+Requires=cerberus-s10.service
+
+[Service]
+Type=simple
+# cerberus-s10 owns the real adb socket; the group of this unit owns the broker's socket (only the work account in it)
+User=cerberus-s10
+Group=s10-trabalho
+ExecStart=/usr/local/sbin/s10-trabalho-adb
+# S10_TRABALHO_UIDS (numeric uids allowed), S10_TRABALHO_DENY_TCP (phone ports never forwarded: VNC, Termux sshd)
+EnvironmentFile=/etc/default/s10-trabalho
+Environment=S10_TRABALHO_SOCKET=/run/s10-trabalho/adb.sock
+Environment=S10_ADB_SOCKET=/run/cerberus-s10/adb.sock
+RuntimeDirectory=s10-trabalho
+RuntimeDirectoryMode=0750
+UMask=0007
+# the window: `s10-trabalho liga` starts it, it stops by itself after 8 h. No Restart=: a crash closes the window.
+RuntimeMaxSec=8h
+Restart=no
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+# unix sockets only: the broker itself can never open a network connection
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+PrivateNetwork=yes
+# the guardian's adb key and the VNC secrets are not the broker's business
+InaccessiblePaths=-/var/lib/cerberus-s10 -/etc/cerberus-s10
+TasksMax=64
+MemoryMax=256M
+LimitNOFILE=512

@@ -1,0 +1,13 @@
+#!/bin/sh
+# adb of the WORK account pointed at the S10 through the broker (s10-trabalho-adb). It does not touch the account's
+# own adb setup (its server on another port keeps working): only this command, and s10-run, use the broker.
+#   s10-adb devices | s10-adb install app.apk | s10-adb logcat ...
+SOCK=${S10_TRABALHO_SOCKET:-/run/s10-trabalho/adb.sock}
+if [ ! -S "$SOCK" ]; then
+    echo "s10-adb: o S10 está fechado para o trabalho (peça na conta pessoal: s10-trabalho liga)" >&2
+    exit 69
+fi
+unset ANDROID_ADB_SERVER_PORT ANDROID_ADB_SERVER_ADDRESS
+ADB_SERVER_SOCKET=localfilesystem:$SOCK
+export ADB_SERVER_SOCKET
+exec "${S10_ADB_BIN:-adb}" "$@"

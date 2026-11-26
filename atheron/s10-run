@@ -1,0 +1,13 @@
+#!/bin/sh
+# Runs one command of the WORK account with its adb pointed at the S10 broker:
+#   s10-run flutter run -d <serial>      s10-run ./gradlew installDebug
+SOCK=${S10_TRABALHO_SOCKET:-/run/s10-trabalho/adb.sock}
+[ $# -gt 0 ] || { echo "uso: s10-run <comando> [args...]" >&2; exit 2; }
+if [ ! -S "$SOCK" ]; then
+    echo "s10-run: o S10 está fechado para o trabalho (peça na conta pessoal: s10-trabalho liga)" >&2
+    exit 69
+fi
+unset ANDROID_ADB_SERVER_PORT ANDROID_ADB_SERVER_ADDRESS
+ADB_SERVER_SOCKET=localfilesystem:$SOCK
+export ADB_SERVER_SOCKET
+exec "$@"

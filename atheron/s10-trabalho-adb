@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""adb broker for the work account (clubpetro) on the atheron.
+
+The work account is firewalled as "a hostile agent may live here": no LAN, no tailnet, never the cerberus-s10 adb
+server. To let it test Android apps on the S10 anyway, it does NOT get that server's socket. It talks to this broker
+(/run/s10-trabalho/adb.sock, group s10-trabalho), which speaks the adb server protocol, lets through only what app
+testing needs (devices, install, logcat, am/pm on non-protected packages, forward to phone-local ports, push/pull
+under /data/local/tmp) and refuses the rest: host:connect (the server runs outside the firewall), arbitrary shell
+(toybox nc to the home LAN), dev:, tcpip, usb, reverse, the guardian's apps (Termux, Tailscale, droidVNC-NG,
+Shizuku), input events (could drive Termux), forwards to the phone's VNC/sshd. Every decision goes to the journal.
+
+What it cannot close: an app you install is a real program on the phone, with network. See README ("Conta de
+trabalho"). The policy is pure (decide, check_shell, SyncFilter) and tested in atheron/tests/test_s10_trabalho_adb.py.
+"""
+import asyncio
+import os
+import posixpath
+import pwd
+import re
+import shlex
+import socket
+import struct
+import sys
+
+PROTECTED = ("com.termux", "com.tailscale.ipn", "net.christianbeier.droidvnc_ng", "moe.shizuku.privileged.api")
+TMP = "/data/local/tmp"
+MAX_REQ = 64 * 1024
+
+HOST_SIMPLE = {"version", "devices", "devices-l", "track-devices", "track-devices-l", "track-devices-proto-binary",
+               "track-devices-proto-text", "features", "host-features", "get-state", "get-serialno", "get-devpath",
+               "list-forward", "server-status", "transport-any", "transport-usb", "transport-local"}
+# no grant/revoke (pm grant WRITE_SECURE_SETTINGS etc. would hand an app system-level powers)
+PM_SUB = {"list", "path", "install", "install-create", "install-write", "install-commit", "install-abandon",
+          "install-existing", "uninstall", "clear", "dump", "resolve-activity", "query-activities", "query-services",
+          "query-receivers"}
+PM_TARGETED = {"uninstall", "clear"}
+# no instrument: an instrumentation APK runs shell-uid commands through UiAutomation (input, nc, Termux)
+AM_SUB = {"start", "start-activity", "startservice", "start-service", "start-foreground-service", "force-stop",
+          "kill", "broadcast"}
+AM_TARGETED = {"force-stop", "kill"}
+SIMPLE_CMDS = {"getprop", "echo", "date", "ps", "pidof", "id", "getenforce", "which"}
+# read-only dumps; battery/deviceidle/usb/notification/wifi/connectivity change state or read other apps' data
+DUMPSYS_OK = {"package", "meminfo", "gfxinfo", "cpuinfo", "activity", "window", "display", "SurfaceFlinger",
+              "procstats", "batterystats", "input"}
+SYSTEM_PKG = ("android", "com.android.", "com.google.", "com.samsung.", "com.sec.", "com.qualcomm.", "com.osp.",
+              "com.knox", "com.wssyncmldm", "com.skms.", "com.policydm")
+LOGCAT_FLAGS = {"-d", "-D", "-B", "--binary", "--dividers", "-s"}
+LOGCAT_VALUED = {"-v", "--format", "-b", "--buffer", "-t", "-T", "--pid", "-e", "--regex", "-m", "--max-count"}
+LOGCAT_PREAMBLE = re.compile(r'^export ANDROID_LOG_TAGS="[^"$`\\]*"; exec (logcat\b.*)$', re.S)
+SHELL_RE = re.compile(r"^shell(?:,[^:]*)?:(.*)$", re.S)
+REDIR = object()   # token marking an unquoted > / >>
+
+
+def config(env):
+    uids = set()
+    for item in env.get("S10_TRABALHO_UIDS", "clubpetro").split():
+        try:
+            uids.add(int(item) if item.isdigit() else pwd.getpwnam(item).pw_uid)
+        except KeyError:
+            pass
+    deny_tcp = {int(p) for p in env.get("S10_TRABALHO_DENY_TCP", "5555 5900 8022").split() if p.isdigit()}
+    return {"uids": uids, "deny_tcp": deny_tcp,
+            # optional: package prefixes of the work apps; when set, clear/uninstall/force-stop/kill/run-as/monkey
+            # only touch those (otherwise anything that is not protected nor a system package)
+            "pkgs": tuple(env.get("S10_TRABALHO_PACOTES", "").split()),
+            "max_conn": int(env.get("S10_TRABALHO_MAX_CONEXOES", "32")),
+            "listen": env.get("S10_TRABALHO_SOCKET", "/run/s10-trabalho/adb.sock"),
+            "upstream": env.get("S10_ADB_SOCKET", "/run/cerberus-s10/adb.sock")}
+
+
+def mentions_protected(tokens):
+    return any(p in t for t in tokens for p in PROTECTED)
+
+
+def in_tmp(path, allow_dir=True):
+    if not path.startswith("/") or "\0" in path:
+        return False
+    p = posixpath.normpath(path)
+    return (allow_dir and p == TMP) or p.startswith(TMP + "/")
+
+
+def target_ok(pkg, cfg):
+    """May a destructive/targeted operation touch this package?"""
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+", pkg or "") or mentions_protected([pkg]):
+        return False
+    pkgs = (cfg or {}).get("pkgs") or ()
+    if pkgs:
+        return any(pkg == p or pkg.startswith(p.rstrip(".") + ".") for p in pkgs)
+    return not any(pkg == s.rstrip(".") or pkg.startswith(s) for s in SYSTEM_PKG)
+
+
+# ---------------------------------------------------------------------------------------------------- shell commands
+def split_safe(cmd):
+    """argv of a one-line command: only words, '...' and "..." quoting (no expansions) and at most one unquoted
+    `>`/`>>` whose target is a file under /data/local/tmp. The redirection is found by the same state machine that
+    tracks the quotes, so a quote inside other quotes cannot hide it. Returns (tokens, target) or raises ValueError."""
+    words, cur, have, quote, i = [], [], False, None, 0
+    n = len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if ch in "\n\r\0":
+            raise ValueError("comando em várias linhas")
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            else:
+                cur.append(ch)
+        elif quote == '"':
+            if ch in '$`\\!':
+                raise ValueError("expansão dentro de aspas duplas")
+            if ch == '"':
+                quote = None
+            else:
+                cur.append(ch)
+        elif ch in "'\"":
+            quote, have = ch, True
+        elif ch in " \t":
+            if have:
+                words.append("".join(cur))
+                cur, have = [], False
+        elif ch == ">":
+            if have:
+                words.append("".join(cur))
+                cur, have = [], False
+            if i + 1 < n and cmd[i + 1] == ">":
+                i += 1
+            words.append(REDIR)
+        elif ch in ";|&<()$`\\{}*?[]~#!":
+            raise ValueError("sintaxe de shell (%r)" % ch)
+        else:
+            cur.append(ch)
+            have = True
+        i += 1
+    if quote:
+        raise ValueError("aspas desbalanceadas")
+    if have:
+        words.append("".join(cur))
+    redirect = None
+    if words.count(REDIR) > 1:
+        raise ValueError("mais de um redirecionamento")
+    if REDIR in words:
+        k = words.index(REDIR)
+        if k != len(words) - 2 or not in_tmp(words[-1], allow_dir=False):
+            raise ValueError("redirecionamento só para um arquivo em %s, no fim do comando" % TMP)
+        redirect, words = words[-1], words[:k]
+    if not words:
+        raise ValueError("comando vazio")
+    return words, redirect
+
+
+def check_logcat(args):
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in LOGCAT_FLAGS:
+            i += 1
+        elif a in LOGCAT_VALUED:
+            if i + 1 >= len(args):
+                return "logcat %s sem valor" % a
+            i += 2
+        elif re.fullmatch(r"(?:\*|[A-Za-z0-9_][A-Za-z0-9_.-]*):[VDIWEFS*]", a) or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", a):
+            i += 1     # filterspec (tag:level) or a tag after -s
+        else:
+            return "logcat: opção %r não permitida (-f, -r, -c, -G, -S, -P gravam ou mudam o log)" % a
+    return None
+
+
+def check_tokens(t, cfg=None, depth=0):
+    """None if the argv may run on the phone, else the reason."""
+    c, args = t[0], t[1:]
+    if c in SIMPLE_CMDS:
+        return None
+    if c == "logcat":
+        return check_logcat(args)
+    if c == "ls":
+        return None if all(not a.startswith("--") for a in args) else "ls: opção longa não permitida"
+    if c == "dumpsys":
+        if not args or args[0] not in DUMPSYS_OK or mentions_protected(args):
+            return "dumpsys só de %s" % ", ".join(sorted(DUMPSYS_OK))
+        return None
+    if c == "pm" or (c == "cmd" and args[:1] == ["package"]):
+        sub = args[1:] if c == "cmd" else args
+        if not sub or sub[0] not in PM_SUB:
+            return "pm %s não está na lista" % (sub[0] if sub else "")
+        if mentions_protected(sub):
+            return "pacote protegido"
+        if sub[0] in PM_TARGETED and not target_ok(sub[-1], cfg):
+            return "pm %s só em pacotes de trabalho (não do sistema)" % sub[0]
+        return None
+    if c == "am" or (c == "cmd" and args[:1] == ["activity"]):
+        sub = args[1:] if c == "cmd" else args
+        if not sub or sub[0] not in AM_SUB:
+            return "am %s não está na lista" % (sub[0] if sub else "")
+        if mentions_protected(sub):
+            return "pacote protegido"
+        if sub[0] in AM_TARGETED and not target_ok(sub[-1], cfg):
+            return "am %s só em pacotes de trabalho (não do sistema)" % sub[0]
+        return None
+    if c == "settings":
+        return None if args[:1] == ["get"] else "só settings get"
+    if c == "wm":
+        return None if len(args) == 1 and args[0] in ("size", "density") else "wm só para ler size/density"
+    if c in ("mkdir", "rm", "chmod", "touch", "cat"):
+        paths = []
+        for a in args:
+            if re.fullmatch(r"-[A-Za-z]+", a):
+                continue
+            if a.startswith("-"):
+                return "%s: opção %r não permitida" % (c, a)
+            if c == "chmod" and re.fullmatch(r"[0-7]{3,4}|[ugoa]*[-+=][rwx]+", a):
+                continue
+            paths.append(a)
+        if not paths or not all(in_tmp(p, allow_dir=(c == "cat")) for p in paths):
+            return "%s só em arquivos dentro de %s" % (c, TMP)
+        return None
+    if c == "screencap":
+        files = [a for a in args if a != "-p"]
+        if len(files) > 1 or not all(in_tmp(f, allow_dir=False) for f in files):
+            return "screencap só para a saída ou um arquivo em %s" % TMP
+        return None
+    if c == "screenrecord":
+        valued = {"--size", "--bit-rate", "--time-limit"}
+        i, files = 0, []
+        while i < len(args):
+            if args[i] in valued and i + 1 < len(args):
+                i += 2
+            elif args[i] in ("--verbose", "--bugreport"):
+                i += 1
+            else:
+                files.append(args[i])
+                i += 1
+        if len(files) != 1 or not in_tmp(files[0], allow_dir=False):
+            return "screenrecord só para um arquivo em %s" % TMP
+        return None
+    if c == "uiautomator":
+        if args[:1] != ["dump"] or not all(in_tmp(a, allow_dir=False) or a in ("--compressed", "/dev/tty") for a in args[1:]):
+            return "uiautomator só dump"
+        return None
+    if c == "monkey":
+        # only: monkey -p <pkg> [-v ...] [--throttle N] <count>; --port/-f/--script would inject input anywhere
+        rest = args[2:] if args[:1] == ["-p"] and len(args) > 2 else None
+        if rest is None or not target_ok(args[1], cfg):
+            return "monkey só com -p de um pacote de trabalho"
+        i = 0
+        while i < len(rest) - 1:
+            if rest[i] == "-v":
+                i += 1
+            elif rest[i] == "--throttle" and rest[i + 1].isdigit():
+                i += 2
+            else:
+                return "monkey: opção %r não permitida" % rest[i]
+        return None if rest[-1:] and rest[-1].isdigit() else "monkey precisa do número de eventos no fim"
+    if c == "run-as":
+        if len(args) < 2 or depth or not target_ok(args[0], cfg):
+            return "run-as precisa de pacote de trabalho e de um comando"
+        return check_tokens(args[1:], cfg, depth + 1)
+    return "comando %r não está na lista" % c
+
+
+def check_shell(cmd, cfg=None):
+    """None if allowed, else the reason. Interactive shells (empty command) are refused."""
+    if cmd.strip() == "":
+        return "shell interativo"
+    m = LOGCAT_PREAMBLE.match(cmd)
+    if m:
+        cmd = m.group(1)
+    try:
+        tokens, _ = split_safe(cmd)
+    except ValueError as e:
+        return str(e)
+    return check_tokens(tokens, cfg)
+
+
+# ---------------------------------------------------------------------------------------------------- host / device
+def split_host(req):
+    """The command of a host request (host:, host-usb:, host-local:, host-serial:<s>:, host-transport-id:<n>:), or
+    None for a device service. Serials with ':' (ip:port, mDNS) are refused: the server's own parsing of them could
+    differ from ours; use the USB serial (or `adb -d`)."""
+    for pre in ("host-usb:", "host-local:", "host:"):
+        if req.startswith(pre):
+            return req[len(pre):]
+    m = re.fullmatch(r"host-serial:([A-Za-z0-9._-]{1,64}):(.+)", req, re.S) or \
+        re.fullmatch(r"host-transport-id:(\d{1,20}):(.+)", req, re.S)
+    if m:
+        return m.group(2)
+    if req.startswith("host-"):
+        return "?invalid"
+    return None
+
+
+def check_forward(spec, deny_tcp):
+    body = spec[len("forward:"):]
+    if body.startswith("norebind:"):
+        body = body[len("norebind:"):]
+    if ";" not in body:
+        return "forward sem destino"
+    local, remote = body.split(";", 1)
+    lm = re.fullmatch(r"tcp:(\d{1,5})", local)
+    if not lm or not (int(lm.group(1)) == 0 or 30000 <= int(lm.group(1)) <= 65535):
+        return "forward: lado local só tcp:0 ou tcp:30000-65535"
+    return check_phone_socket(remote, deny_tcp)
+
+
+def check_phone_socket(spec, deny_tcp):
+    m = re.fullmatch(r"tcp:(\d{1,5})", spec)
+    if m:
+        return "porta %s do celular é do guardião" % m.group(1) if int(m.group(1)) in deny_tcp else None
+    if re.fullmatch(r"localabstract:[A-Za-z0-9._@-]{1,100}", spec) or re.fullmatch(r"jdwp:\d{1,7}", spec):
+        return None
+    return "socket do celular %r não permitido" % spec
+
+
+def decide(req, cfg):
+    """(allowed, reason, kind). kind: 'transport' (answer, then keep reading), 'sync' (filtered pipe), 'pipe'."""
+    deny_tcp = cfg["deny_tcp"]
+    cmd = split_host(req)
+    if cmd is not None:
+        if cmd in HOST_SIMPLE or re.fullmatch(r"wait-for-[a-z-]{1,30}", cmd):
+            kind = "transport" if cmd.startswith("transport") else "host"
+            return True, "consulta", kind
+        if re.fullmatch(r"(transport|transport-id|tport):[A-Za-z0-9._:\[\]-]{1,128}", cmd):
+            return True, "escolha do aparelho", "transport"
+        if cmd.startswith("forward:"):
+            why = check_forward(cmd, deny_tcp)
+            return why is None, why or "forward", "host"
+        if cmd.startswith("killforward:"):
+            m = re.fullmatch(r"killforward:tcp:(\d{1,5})", cmd)
+            ok = bool(m) and 30000 <= int(m.group(1)) <= 65535
+            return ok, "killforward" if ok else "killforward só das portas tcp:30000-65535", "host"
+        return False, "serviço do servidor adb não permitido (%s)" % cmd.split(":", 1)[0], "pipe"
+    m = SHELL_RE.match(req)
+    if m or req.startswith("exec:"):
+        why = check_shell(m.group(1) if m else req[len("exec:"):], cfg)
+        return why is None, why or "comando permitido", "pipe"
+    if req == "sync:":
+        return True, "sync (só %s)" % TMP, "sync"
+    if req.startswith("abb_exec:") or req.startswith("abb:"):
+        args = req.split(":", 1)[1].split("\0")
+        if args[:2] == ["settings", "get"]:
+            return True, "settings get", "pipe"
+        if args[:1] == ["package"] and len(args) > 1 and args[1] in PM_SUB and not mentions_protected(args):
+            if args[1] in PM_TARGETED and not target_ok(args[-1], cfg):
+                return False, "package %s só em pacotes de trabalho" % args[1], "pipe"
+            return True, "package %s" % args[1], "pipe"
+        return False, "abb %s não permitido" % " ".join(args[:2]), "pipe"
+    if req in ("track-jdwp", "track-app") or req.startswith("framebuffer:") or re.fullmatch(r"jdwp:\d{1,7}", req):
+        return True, "depuração/tela", "pipe"
+    if req.startswith("tcp:") or req.startswith("localabstract:"):
+        why = check_phone_socket(req, deny_tcp)
+        return why is None, why or "socket local do celular", "pipe"
+    return False, "serviço do aparelho não permitido (%s)" % req.split(":", 1)[0], "pipe"
+
+
+# ---------------------------------------------------------------------------------------------------- sync filter
+def parse_mode(text):
+    """File mode the way adbd reads it (strtoul base 0: 0x.. hex, 0.. octal, else decimal); None if malformed."""
+    if re.fullmatch(r"0[xX][0-9a-fA-F]{1,8}", text):
+        return int(text, 16)
+    if re.fullmatch(r"0[0-7]{0,11}", text):
+        return int(text, 8)
+    if re.fullmatch(r"[1-9][0-9]{0,9}", text):
+        return int(text)
+    return None
+
+
+def regular_mode(mode):
+    """Only plain files may be created (type bits 0 or S_IFREG): never symlinks, devices, fifos."""
+    return mode is not None and (mode & 0o170000) in (0, 0o100000)
+
+
+class SyncFilter:
+    """Incremental parser of the client->server sync stream. feed(bytes) -> (bytes to forward, error or None).
+    Paths must be under /data/local/tmp; symlinks are never created."""
+    PATH_IDS = {b"SEND", b"SND2", b"RECV", b"RCV2", b"STAT", b"STA2", b"LSTA", b"LIST", b"LIS2", b"LST2"}
+
+    def __init__(self):
+        self.buf = b""
+        self.refused = None     # id of the request that was refused (to shape the answer)
+        self.need_extra = 0     # setup struct after an SND2 (12 bytes) / RCV2 (8 bytes) path
+        self.data_left = 0
+
+    def feed(self, chunk):
+        self.buf += chunk
+        out = b""
+        while True:
+            if self.data_left:
+                n = min(self.data_left, len(self.buf))
+                out, self.buf, self.data_left = out + self.buf[:n], self.buf[n:], self.data_left - n
+                if self.data_left:
+                    return out, None
+                continue
+            if self.need_extra:
+                if len(self.buf) < self.need_extra:
+                    return out, None
+                extra, self.buf = self.buf[:self.need_extra], self.buf[self.need_extra:]
+                if self.need_extra == 12:
+                    mode = struct.unpack("<I", extra[4:8])[0]
+                    if not regular_mode(mode):
+                        self.refused = b"SND2"
+                        return out, "sync: só arquivos comuns"
+                out += extra
+                self.need_extra = 0
+                continue
+            if len(self.buf) < 8:
+                return out, None
+            ident, n = self.buf[:4], struct.unpack("<I", self.buf[4:8])[0]
+            if ident in self.PATH_IDS:
+                if n > 4096:
+                    return out, "sync: caminho longo demais"
+                if len(self.buf) < 8 + n:
+                    return out, None
+                try:
+                    raw = self.buf[8:8 + n].decode("utf-8")      # strict: no lossy decoding
+                except UnicodeDecodeError:
+                    self.refused = ident
+                    return out, "sync: caminho com bytes inválidos"
+                path = raw
+                if ident == b"SEND":
+                    path, _, mode = raw.rpartition(",")
+                    if not regular_mode(parse_mode(mode)):
+                        self.refused = ident
+                        return out, "sync: só arquivos comuns (modo %r)" % mode
+                if "\0" in path or not in_tmp(path, allow_dir=ident not in (b"SEND", b"SND2")):
+                    self.refused = ident
+                    return out, "sync: %s fora de %s" % (path, TMP)
+                out += self.buf[:8 + n]
+                self.buf = self.buf[8 + n:]
+                self.need_extra = 12 if ident == b"SND2" else 8 if ident == b"RCV2" else 0
+            elif ident == b"DATA":
+                out, self.buf, self.data_left = out + self.buf[:8], self.buf[8:], n
+            elif ident in (b"DONE", b"QUIT"):
+                out, self.buf = out + self.buf[:8], self.buf[8:]
+            else:
+                return out, "sync: mensagem desconhecida %r" % ident
+
+
+# ---------------------------------------------------------------------------------------------------- proxy
+ACTIVE = {}   # open connections per uid
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+async def read_request(reader):
+    try:
+        head = await reader.readexactly(4)
+    except asyncio.IncompleteReadError:
+        return None
+    if not re.fullmatch(rb"[0-9a-fA-F]{4}", head):
+        return None
+    n = int(head, 16)
+    if n > MAX_REQ:
+        return None
+    try:
+        return await reader.readexactly(n)
+    except asyncio.IncompleteReadError:
+        return None
+
+
+def fail(writer, msg):
+    data = msg.encode("utf-8")[:4000]
+    writer.write(b"FAIL" + b"%04x" % len(data) + data)
+
+
+def sync_refusal(ident, msg):
+    """The answer a real server gives when a sync request fails, shaped for that request, so the adb client reports
+    an error instead of aborting on a cut stream: stat v2 with EACCES, stat v1 all zeros (not found), an empty
+    listing, or a FAIL frame for transfers."""
+    if ident in (b"STA2", b"LST2"):
+        return ident + struct.pack("<I", 13) + b"\0" * 64          # sync_stat_v2 with error = EACCES
+    if ident == b"STAT":
+        return b"STAT" + b"\0" * 12
+    if ident in (b"LIST", b"LIS2"):
+        return b"DONE" + b"\0" * (16 if ident == b"LIST" else 68)
+    data = ("s10-trabalho: " + msg).encode("utf-8")[:1000]
+    return b"FAIL" + struct.pack("<I", len(data)) + data
+
+
+async def pump(src, dst, filt=None, half_close=False, on_refuse=None):
+    """Copy src -> dst. half_close: at EOF only shut dst's write side (the other direction still carries the
+    answer, e.g. `adb install` waits for "Success" after sending the APK); a refused sync message closes for good."""
+    clean = False
+    try:
+        while True:
+            chunk = await src.read(65536)
+            if not chunk:
+                clean = True
+                break
+            if filt:
+                chunk, err = filt.feed(chunk)
+                if err:
+                    log("RECUSADO %s" % err)
+                    if chunk:
+                        dst.write(chunk)
+                    if on_refuse:
+                        on_refuse(err)
+                    break
+            dst.write(chunk)
+            await dst.drain()
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        try:
+            if clean and half_close and dst.can_write_eof():
+                dst.write_eof()
+            else:
+                dst.close()
+        except Exception:
+            pass
+
+
+async def handle(reader, writer, cfg):
+    sock = writer.get_extra_info("socket")
+    try:
+        uid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[1]
+    except OSError:
+        uid = -1
+    up_r = up_w = None
+    counted = False
+    try:
+        if uid in cfg["uids"] and ACTIVE.get(uid, 0) >= cfg.get("max_conn", 32):
+            log("RECUSADO uid=%s: limite de %s conexões" % (uid, cfg.get("max_conn", 32)))
+            await read_request(reader)
+            fail(writer, "s10-trabalho: conexões demais")
+            await writer.drain()
+            return
+        ACTIVE[uid] = ACTIVE.get(uid, 0) + 1
+        counted = True
+        if uid not in cfg["uids"]:
+            log("RECUSADO uid=%s fora da lista" % uid)
+            await read_request(reader)   # consume it: closing with unread data would reset before the FAIL arrives
+            fail(writer, "s10-trabalho: uid %s não autorizado" % uid)
+            await writer.drain()
+            return
+        while True:
+            req = await read_request(reader)
+            if req is None:
+                return
+            text = req.decode("latin-1")
+            ok, why, kind = decide(text, cfg)
+            log("%s uid=%s %r — %s" % ("OK" if ok else "RECUSADO", uid, text[:200], why))
+            if not ok:
+                fail(writer, "s10-trabalho: recusado: %s" % why)
+                await writer.drain()
+                return
+            if up_w is None:
+                up_r, up_w = await asyncio.open_unix_connection(cfg["upstream"])
+            up_w.write(b"%04x" % len(req) + req)
+            await up_w.drain()
+            if kind == "transport":
+                status = await up_r.readexactly(4)
+                if status == b"OKAY":
+                    extra = await up_r.readexactly(8) if text.split(":", 2)[1:2] == ["tport"] else b""
+                    writer.write(status + extra)
+                    await writer.drain()
+                    continue
+                n = await up_r.readexactly(4)
+                msg = await up_r.readexactly(int(n, 16))
+                writer.write(status + n + msg)
+                await writer.drain()
+                return
+            if kind == "host":
+                # a host service takes no more input: nothing else from the client reaches the server
+                if up_w.can_write_eof():
+                    up_w.write_eof()
+                await pump(up_r, writer)
+                return
+            if kind == "sync":
+                # the refusal answers the client itself and ends both directions (the server must not see more)
+                filt = SyncFilter()
+
+                def refuse(err, w=writer, uw=up_w, f=filt):
+                    uw.close()
+                    w.write(sync_refusal(f.refused or b"FAIL", err))
+                await asyncio.gather(pump(reader, up_w, filt, on_refuse=refuse), pump(up_r, writer))
+            else:
+                await asyncio.gather(pump(reader, up_w, half_close=True), pump(up_r, writer))
+            return
+    except (ConnectionError, OSError, asyncio.IncompleteReadError) as e:
+        log("conexão encerrada (uid=%s): %s" % (uid, e))
+    finally:
+        if counted:
+            ACTIVE[uid] -= 1
+        for w in (writer, up_w):
+            if w is not None:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+
+
+async def serve(cfg):
+    path = cfg["listen"]
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    server = await asyncio.start_unix_server(lambda r, w: handle(r, w, cfg), path=path)
+    os.chmod(path, 0o660)
+    log("s10-trabalho-adb: escutando em %s (uids %s) -> %s" % (path, sorted(cfg["uids"]), cfg["upstream"]))
+    async with server:
+        await server.serve_forever()
+
+
+def main():
+    cfg = config(os.environ)
+    if not cfg["uids"]:
+        log("nenhum uid autorizado (S10_TRABALHO_UIDS)")
+        return 1
+    asyncio.run(serve(cfg))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
