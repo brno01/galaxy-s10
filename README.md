@@ -29,7 +29,8 @@ O adb do atheron **não tem listener TCP** (nem 5037): só o socket unix `/run/c
 | `termux/` | `bootstrap.sh`, `boot/10-sshd.sh`, `boot/20-guardian.sh`, `dev-setup.sh` + `s10-dev-shell` (VS Code), `authorized_keys.example`, testes |
 | `docs/` | `testes-de-falha.md` (drills de recuperação) |
 | `nomad/` | `s10` (wrapper com 3 caminhos e `status`), `s10.desktop`, testes |
-| `windows/` | `s10-dev.sh`: prepara o VS Code Remote-SSH a partir do Windows (chave, passo do atheron, `~/.ssh/config`, teste) |
+| `windows/` | `s10-dev.sh` (VS Code no Debian do S10), `s10-apps.sh` + `s10-tela.ps1` (testar apps no S10 a partir do atheron: scrcpy e tela na aba), testes |
+| `atheron/dev/` | conta de desenvolvimento no atheron: `adb` de proteção, ambiente, `s10-tela-web` (noVNC) e `install-dev.sh` |
 
 ## Testes e CI
 
@@ -288,6 +289,31 @@ O Debian vem do espelho público da AWS das imagens oficiais (`public.ecr.aws/do
 4. No VS Code: `"remote.SSH.remotePlatform": {"s10-dev": "linux"}` nas configurações e `Remote-SSH: Connect to Host...` → `s10-dev`.
 
 Tirar o acesso: apague a linha da chave `wtg-s10-dev` no `~/.ssh/authorized_keys` do Termux (`sh bootstrap.sh --remove-key wtg-s10-dev`). Apagar o Debian: `proot-distro remove debian`.
+
+## Testar apps no S10 a partir do atheron
+
+Você desenvolve no atheron (VS Code Remote-SSH como `claude`) e roda o app no S10, que já está no USB do atheron. Não precisa parear nada: a conta de desenvolvimento usa o mesmo servidor adb do `cerberus-s10`, pelo socket unix.
+
+```
+VS Code (Windows) ── Remote-SSH :2222 ──▶ claude@atheron ── adb (guarda ~/.local/bin/adb) ──▶ /run/cerberus-s10/adb.sock ──▶ S10 (USB)
+   Ctrl+Alt+Shift+S: aba ◀── 6080 encaminhada ── websockify + noVNC (127.0.0.1:6080) ── adb forward 15900 ──▶ droidVNC-NG (lo:5900, senha)
+   Ctrl+Alt+S: scrcpy ◀── ssh -L 15037/27183 :2222 s10tunnel@atheron (só túnel) ──▶ mesmo servidor adb
+```
+
+- **adb no atheron:** `user-step-s10.sh --dev-user claude` (root) põe a conta no grupo `cerberus-s10` e copia a senha do VNC (0600). O `atheron/dev/install-dev.sh` (como a própria conta, sem root) instala o `adb` de proteção, que recusa `kill-server`, `tcpip`, `usb`, `-a`, `-L`, `server`/`nodaemon`, `disconnect` sem alvo e `forward --remove-all` (derrubariam o guardião ou abririam o celular para a rede). Ele também instala `ADB_SERVER_SOCKET` em `~/.config/dev/env.d/s10-adb.sh`, de modo que SDK, Flutter e Gradle usam o mesmo servidor. `adb devices`, `adb install`, `flutter run` funcionam direto.
+- **Tela numa aba do VS Code:** serviço `systemd --user` `s10-tela-web` (noVNC 1.7.0 com sha256 conferido, websockify 0.13.0 por `uv tool`), só em `127.0.0.1:6080`. A senha do VNC vai no `#` da URL, que o navegador nunca manda ao servidor. A unit entra no grupo com `sg`, então funciona sem reiniciar o `systemd --user`. `s10-tela-web start|stop|status|url`.
+- **Janela nativa (scrcpy):** `windows/s10-tela.ps1` sobe um ssh para o `s10tunnel` (usuário restrito: só túnel para o socket do adb e a 27183), roda o scrcpy com `ANDROID_ADB_SERVER_PORT=15037` e `--force-adb-forward`, e fecha o túnel junto. A porta 15037 não briga com um adb local do Windows (Android Studio).
+- O grupo dá à conta (e aos agentes que rodam nela) controle total do S10 pelo adb e leitura do `estado.json`. O `adb` de proteção evita acidentes (uma IDE, um script, um reflexo), não um processo hostil: a conta sempre pode chamar `/usr/bin/adb` direto. A fronteira de verdade é o grupo no socket. Tirar: `user-step-s10.sh --dev-user-undo claude` e `install-dev.sh --undo`.
+- A senha do VNC fica em texto puro no Windows (no `keybindings.json` do VS Code) e na cópia 0600 da conta no atheron. O VNC só escuta no loopback do celular, e chegar nele exige o adb do atheron ou o túnel restrito. Para não guardar a senha no Windows, troque o `args` da tecla por `http://localhost:6080/vnc.html#autoconnect=1&resize=scale`: aí o noVNC pede a senha (`cat ~/.config/s10/vnc-password` no atheron).
+- A cópia da senha é escrita pela própria conta (`runuser`), com o conteúdo vindo do root por stdin: o root nunca grava num caminho que a conta controla.
+
+**Passo do USUÁRIO, uma vez** (Windows, MSYS2 UCRT64 ou Git Bash; idempotente):
+
+```bash
+ssh root@atheron cat <checkout-no-atheron>/windows/s10-apps.sh > /tmp/s10-apps.sh && bash /tmp/s10-apps.sh
+```
+
+Ele cria a chave `s10-tela_ed25519` e, num ssh só como root, autoriza essa chave no `s10tunnel` (`--tunnel-key`), roda o `--dev-user claude` e o `install-dev.sh` como `claude`. No Windows, instala o scrcpy (winget) e o `%LOCALAPPDATA%\s10\s10-tela.ps1`, acrescenta os apelidos `s10-tela` e `atheron-claude` ao `~/.ssh/config` e cria o atalho "S10 tela" no menu Iniciar (Ctrl+Alt+S). No VS Code, acrescenta `remote.SSH.defaultForwardedPorts` (6080) e a tecla Ctrl+Alt+Shift+S. Os blocos dele nos JSON do VS Code ficam entre `// s10-begin` e `// s10-end` e são trocados a cada execução. Antes da primeira mudança ele guarda uma cópia `*.antes-s10`. Se o arquivo não começar com `{`/`[` numa linha só, ou se os marcadores estiverem desemparelhados, ele não mexe e avisa. Os apelidos SSH dele ficam num bloco `# s10-begin`/`# s10-end` do `~/.ssh/config`, refeito a cada execução; um `Host` com o mesmo nome escrito à mão fora do bloco é mantido.
 
 ## Ligar o atheron pelo S10 (Wake-on-LAN)
 

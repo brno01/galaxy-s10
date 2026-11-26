@@ -1,0 +1,44 @@
+#!/bin/bash
+# adb for development accounts on the atheron (installed as ~/.local/bin/adb by atheron/dev/install-dev.sh).
+# Talks to the cerberus-s10 adb server through its unix socket (no TCP :5037) and refuses the commands that would
+# take that server down or open the phone to the network: the guardian (cerberus-s10) depends on it.
+# Everything else goes to the real adb untouched (install, shell, logcat, forward, reverse, push, pull...).
+# This guards against ACCIDENTS (an IDE, a script, a reflex), not against a hostile process: the account can always call
+# /usr/bin/adb directly. The real boundary is the cerberus-s10 group on the socket.
+REAL=${S10_REAL_ADB:-/usr/bin/adb}
+export ADB_SERVER_SOCKET=${ADB_SERVER_SOCKET:-localfilesystem:/run/cerberus-s10/adb.sock}
+
+refuse() {
+    echo "adb (S10): '$1' recusado: $2" >&2
+    echo "  o servidor adb é do serviço cerberus-s10 (guardião do S10); use o adb de verdade só como root: $REAL" >&2
+    exit 64
+}
+
+# find the subcommand after the global options (-s SERIAL, -t ID, -H HOST, -P PORT, -L SOCKET take a value)
+args=("$@")
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+    a=${args[$i]}
+    case "$a" in
+    -a) refuse "-a" "faria o servidor escutar em todas as interfaces" ;;
+    -L) refuse "-L" "trocaria o socket do servidor" ;;
+    -s|-t|-H|-P) i=$((i + 2)); continue ;;
+    -*) i=$((i + 1)); continue ;;
+    esac
+    break
+done
+sub=${args[$i]:-}
+next=${args[$((i + 1))]:-}
+case "$sub" in
+kill-server) refuse "$sub" "derrubaria o servidor do guardião" ;;
+server|nodaemon|fork-server) refuse "$sub" "subiria outro servidor adb" ;;
+tcpip) refuse "$sub" "abriria o adb do celular para a rede (porta TCP)" ;;
+usb) refuse "$sub" "reiniciaria o adbd do celular e derrubaria o adb sem fio" ;;
+disconnect) refuse "disconnect" "derrubaria o adb sem fio que o guardião mantém" ;;
+forward)
+    case "$next" in
+    --remove-all) refuse "forward --remove-all" "apagaria os encaminhamentos do scrcpy e da tela" ;;
+    --remove) case "${args[$((i + 2))]:-}" in tcp:15900|tcp:27183) refuse "forward --remove ${args[$((i + 2))]}" "é o encaminhamento da tela (15900) ou do scrcpy (27183)" ;; esac ;;
+    esac ;;
+esac
+exec "$REAL" "$@"

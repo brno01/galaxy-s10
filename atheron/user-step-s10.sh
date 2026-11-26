@@ -1,10 +1,13 @@
 #!/bin/bash
 # Passo do USUÁRIO: instala o monitor/guardião do Galaxy S10 (adb por USB) no atheron (Debian).
-# Uso: bash user-step-s10.sh [--check|--undo|--vnc-key|--tunnel-key <arquivo.pub>]      Detalhes: ../README.md
+# Uso: bash user-step-s10.sh [--check|--undo|--vnc-key|--tunnel-key <arquivo.pub>|--dev-user[-undo] <usuário>]
+#                                                                                          Detalhes: ../README.md
 #   (sem args)            instala o serviço, o usuário do túnel, a senha do VNC (aleatória, só se faltar) e a regra udev
 #   --vnc-key             pede (entrada oculta) a "Chave de acesso da API de Intent" do droidVNC-NG e grava em
 #                         /etc/cerberus-s10/vnc-access-key (0600), reiniciando o serviço
 #   --tunnel-key <.pub>   autoriza uma chave pública do nomad para o usuário s10tunnel (só túnel + estado)
+#   --dev-user <usuário>  conta de desenvolvimento no atheron (ex.: claude): entra no grupo cerberus-s10 (adb do S10 pelo
+#                         socket) e ganha uma cópia 0600 da senha do VNC; --dev-user-undo <usuário> desfaz
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 BIN=/usr/local/sbin/cerberus-s10
@@ -73,6 +76,9 @@ check() {
         if [ -n "$l" ]; then bad "há um listener TCP em :5037 ($(echo "$l" | awk '{print $4}' | tr '\n' ' ')): o adb deve usar só o socket unix"
         else ok "nenhum listener TCP :5037"; fi
     fi
+    local devs
+    devs=$(getent group "$SVC_USER" | cut -d: -f4 | tr ',' '\n' | grep -vxE "$SVC_USER|$TUN_USER" | grep -v "^$" | tr '\n' ' ' || true)
+    echo "info:   contas de desenvolvimento com o adb do S10 (grupo $SVC_USER): ${devs:-nenhuma}"
     if [ -S /run/cerberus-s10/adb.sock ]; then ok "socket do adb $(stat -c '%a %U:%G' /run/cerberus-s10/adb.sock)"
     else bad "/run/cerberus-s10/adb.sock ausente (adb server parado?)"; fi
     if [ -f /run/cerberus-s10/estado.json ]; then
@@ -139,6 +145,40 @@ case "${1:-}" in
     chmod 600 "$AK"
     [ -n "$NONROOT" ] || chown -R "$TUN_USER:$(id -gn "$TUN_USER")" "$TUN_HOME/.ssh"
     echo "$n chave(s) autorizada(s) para $TUN_USER (só túnel para o adb/27183 e leitura do estado)."
+    exit 0 ;;
+--dev-user|--dev-user-undo)
+    need_root
+    dev=${2:-}
+    case "$dev" in
+    ''|root|"$SVC_USER"|"$TUN_USER") echo "uso: $0 $1 <usuário de desenvolvimento> (não root, $SVC_USER nem $TUN_USER)"; exit 2 ;;
+    esac
+    entry=$(getent passwd "$dev") || { echo "usuário '$dev' não existe"; exit 2; }
+    dev_home=$(printf '%s\n' "$entry" | cut -d: -f6)
+    dev_pw=$dev_home/.config/s10/vnc-password
+    member=0
+    id -nG "$dev" | tr ' ' '\n' | grep -qx "$SVC_USER" && member=1
+    # everything inside the account's home is done AS the account: root never follows a path it controls (a planted
+    # symlink would otherwise make root overwrite any file)
+    as_dev() { "${S10_RUNUSER:-runuser}" -u "$dev" -- "$@"; }
+    if [ "$1" = --dev-user-undo ]; then
+        [ "$member" -eq 1 ] && gpasswd -d "$dev" "$SVC_USER"
+        as_dev rm -f "$dev_pw"
+        echo "$dev fora do grupo $SVC_USER e sem a cópia da senha do VNC (vale no próximo login)."
+        exit 0
+    fi
+    # the group opens /run/cerberus-s10 (adb socket, estado.json): full adb control of the S10 for this account
+    [ "$member" -eq 1 ] || usermod -aG "$SVC_USER" "$dev"
+    if [ -s "$PWFILE" ]; then
+        # root reads the password file and hands it over on stdin; the account writes its own copy
+        # shellcheck disable=SC2016  # $1/$d expand in the account's sh, not here
+        as_dev sh -c 'umask 077; d=$1; mkdir -p "$d" && chmod 700 "$d" && cat > "$d/vnc-password.tmp" &&
+            chmod 600 "$d/vnc-password.tmp" && mv -f "$d/vnc-password.tmp" "$d/vnc-password"' sh "$dev_home/.config/s10" < "$PWFILE"
+        pw_note="senha do VNC copiada para $dev_pw (0600)"
+    else
+        pw_note="sem senha do VNC em $PWFILE: a aba do VS Code vai pedir a senha"
+    fi
+    echo "$dev no grupo $SVC_USER (adb do S10 pelo socket); $pw_note."
+    echo "O grupo novo só vale num login novo do $dev (feche e reabra as sessões; systemctl --user, tmux)."
     exit 0 ;;
 --undo)
     [ "$(id -u)" -eq 0 ] || { echo "rode como root"; exit 1; }
