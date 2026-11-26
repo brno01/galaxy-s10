@@ -25,10 +25,11 @@ O adb do atheron **não tem listener TCP** (nem 5037): só o socket unix `/run/c
 
 | Pasta | O que é |
 |---|---|
-| `atheron/` | `cerberus-s10` (monitor + guardião), unit systemd, regra udev, `user-step-s10.sh`, testes |
-| `termux/` | `bootstrap.sh`, `boot/10-sshd.sh`, `boot/20-guardian.sh`, `authorized_keys.example`, testes |
+| `atheron/` | `cerberus-s10` (monitor + guardião), unit systemd, regra udev, `user-step-s10.sh`, `user-step-s10-dev.sh` (VS Code pelo USB), testes |
+| `termux/` | `bootstrap.sh`, `boot/10-sshd.sh`, `boot/20-guardian.sh`, `dev-setup.sh` + `s10-dev-shell` (VS Code), `authorized_keys.example`, testes |
 | `docs/` | `testes-de-falha.md` (drills de recuperação) |
 | `nomad/` | `s10` (wrapper com 3 caminhos e `status`), `s10.desktop`, testes |
+| `windows/` | `s10-dev.sh`: prepara o VS Code Remote-SSH a partir do Windows (chave, passo do atheron, `~/.ssh/config`, teste) |
 
 ## Testes e CI
 
@@ -231,6 +232,62 @@ s10 -- --record=s10.mkv    # argumentos extras vão ao scrcpy
 ```
 
 Sempre: `--turn-screen-off --stay-awake`; áudio desligado no caminho USB (`--audio` liga). Variáveis: `S10_TUNNEL` (padrão `s10tunnel@atheron`: usuário restrito do túnel e do estado), `S10_ATHERON` (padrão `root@atheron`, só manutenção/`setup-vnc`; se definido sem `S10_TUNNEL`, também serve ao túnel), `S10_SERIAL`, `S10_PHONE` (galaxy-s10), `S10_TAILNET_IP`, `S10_TERMUX_USER` (usuário do Termux para o `--vnc`), `S10_VNC_LPORT` (5901). O caminho 2 pega IP/porta do `estado.json` do atheron, senão mDNS (`adb mdns services`/`avahi-browse`), senão o IP da tailnet com a última porta em `~/.cache/s10/estado.json`. O túnel segue a doc do scrcpy ("Remote ADB server"): `ssh -CN -L5038:localhost:5037 -R27183:localhost:27183`, com `ADB_SERVER_SOCKET=tcp:localhost:5038`; ao sair, o túnel é derrubado. Se o atheron não enxergar o S10 o script explica em português (cabo, `--check`, chave RSA).
+
+## Desenvolver no S10 (VS Code Remote-SSH)
+
+O servidor do VS Code não roda no Termux (libc bionic). Por isso o S10 ganha um Debian pelo `proot-distro`, e uma chave SSH só para isso entra direto nele:
+
+```
+VS Code (nomad) ── ssh s10-dev ──▶ sshd do Termux :8022 ── command= ──▶ s10-dev-shell ──▶ proot-distro login debian
+                     └─ -D/-L (encaminhamento) ──▶ 127.0.0.1 do celular = servidor do VS Code dentro do Debian
+```
+
+- Sem porta nova e sem mudança na política da tailnet: tudo passa pela 8022.
+- A chave `s10-dev_ed25519` fica no `authorized_keys` com `restrict,port-forwarding,pty,command="…/s10-dev-shell"`: só terminal e encaminhamento de porta, sem agent forwarding. A chave de sempre (`nomad_ed25519`) continua no Termux puro, e o `s10` não muda.
+- Dentro do Debian você é root falso do proot (o dono real é o usuário do Termux). Sem `systemd`, sem módulos do kernel e sem montar nada; `apt install` funciona.
+- Não dá para rodar um sshd *dentro* do proot: a separação de privilégios do OpenSSH faz `chroot`, que o proot recusa (testado em 24/11/2026).
+- O Android 12 mata processos "fantasmas" (filhos de apps) acima de 32, e o VS Code abre muitos. O `cerberus-s10` agora mantém `device_config activity_manager max_phantom_processes` em `2147483647` e a sincronização desligada (`set_sync_disabled_for_tests persistent`), lendo antes e escrevendo só quando há desvio (reparo `phantom_procs`). Vale depois de reinstalar o serviço no atheron.
+- O canal de execução fica aberto enquanto o servidor do VS Code vive, porque o proot espera todos os processos filhos. É esperado.
+
+**Atalho (recomendado):** no Windows, terminal MSYS2 UCRT64 ou Git Bash, uma linha faz os passos 1 a 3 abaixo (idempotente; `--reset-distro` no fim reinstala um Debian quebrado):
+
+```bash
+ssh root@atheron cat <checkout-no-atheron>/windows/s10-dev.sh > /tmp/s10-dev.sh && bash /tmp/s10-dev.sh
+```
+
+O `windows/s10-dev.sh` cria a chave, roda o passo do atheron como root, lê o IP e o usuário do Termux do `nomad/s10.local.conf` do checkout (fora do git), acrescenta o `Host s10-dev` ao `~/.ssh/config` e testa. Na 1ª vez o download do Debian no S10 pode levar dezenas de minutos (o passo do atheron espera até 1 h).
+
+O Debian vem do espelho público da AWS das imagens oficiais (`public.ecr.aws/docker/library/debian:trixie`, `S10_DEV_IMAGE`): o `proot-distro` 5 instala de registries OCI e o Docker Hub recusou os pulls anônimos do S10 com "Unauthorized" (termux/proot-distro#692). O Docker Hub fica como reserva (`S10_DEV_FALLBACK_IMAGE`).
+
+**Passos do USUÁRIO, uma vez** (cliente: Windows 11 do `nomad-wtg`, terminal MSYS2 ou Git Bash):
+
+1. No Windows, crie a chave e mande a parte pública para o atheron:
+   ```bash
+   ssh-keygen -t ed25519 -N '' -C wtg-s10-dev -f ~/.ssh/s10-dev_ed25519
+   scp ~/.ssh/s10-dev_ed25519.pub root@atheron:/root/s10-dev.pub
+   ```
+2. No atheron, como root: reinstale o serviço (reparo `phantom_procs`) e autorize a chave pelo USB. O `atheron/user-step-s10-dev.sh` empurra os arquivos para `/sdcard/Download/s10-dev`, abre o Termux, digita um comando curto e espera o `dev-setup.sh` terminar (na 1ª vez baixa o Debian):
+   ```bash
+   ssh root@atheron 'cp -a /home/claude/development/personal/galaxy-s10/atheron/. /root/s10-atheron/ && bash /root/s10-atheron/user-step-s10.sh'
+   ssh root@atheron 'bash /home/claude/development/personal/galaxy-s10/atheron/user-step-s10-dev.sh /root/s10-dev.pub'
+   ```
+   Não precisa de nenhuma chave já aceita pelo Termux. Com uma chave aceita, dá para rodar o `dev-setup.sh` direto: `ssh <termux> "sh -s -- '<chave pública>'" < termux/dev-setup.sh`.
+3. No Windows, o apelido no `~/.ssh/config` (é o `C:\Users\<você>\.ssh\config` que o VS Code usa):
+   ```
+   Host s10-dev
+       HostName <ip-tailscale-do-s10>
+       HostKeyAlias [galaxy-s10]:8022
+       Port 8022
+       User <usuario-do-termux>
+       IdentityFile ~/.ssh/s10-dev_ed25519
+       IdentitiesOnly yes
+       ConnectTimeout 8
+       ServerAliveInterval 30
+   ```
+   Teste: `ssh s10-dev 'uname -m; cat /etc/debian_version; id -un'` (espera `aarch64`, a versão e `root`).
+4. No VS Code: `"remote.SSH.remotePlatform": {"s10-dev": "linux"}` nas configurações e `Remote-SSH: Connect to Host...` → `s10-dev`.
+
+Tirar o acesso: apague a linha da chave `wtg-s10-dev` no `~/.ssh/authorized_keys` do Termux (`sh bootstrap.sh --remove-key wtg-s10-dev`). Apagar o Debian: `proot-distro remove debian`.
 
 ## Ligar o atheron pelo S10 (Wake-on-LAN)
 

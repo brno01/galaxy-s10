@@ -40,8 +40,9 @@ jobs:
           bash atheron/tests/test_installer.sh
           bash nomad/tests/test_s10.sh
           bash atheron/tests/test_wol.sh
+          bash atheron/tests/test_s10_dev.sh
 
       - name: Shellcheck
         run: |
-          shellcheck -S warning atheron/user-step-s10.sh atheron/wol-atheron.sh atheron/tests/test_wol.sh nomad/s10 nomad/tests/test_s10.sh termux/tests/test_termux.sh atheron/tests/test_installer.sh
-          shellcheck -S warning -s sh termux/bootstrap.sh termux/boot/*.sh termux/acordar-atheron
+          shellcheck -S warning atheron/user-step-s10.sh atheron/user-step-s10-dev.sh atheron/tests/test_s10_dev.sh atheron/wol-atheron.sh atheron/tests/test_wol.sh nomad/s10 nomad/tests/test_s10.sh termux/tests/test_termux.sh atheron/tests/test_installer.sh windows/s10-dev.sh
+          shellcheck -S warning -s sh termux/bootstrap.sh termux/boot/*.sh termux/acordar-atheron termux/dev-setup.sh termux/s10-dev-shell

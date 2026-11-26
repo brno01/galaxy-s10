@@ -1,0 +1,10 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Forced command (authorized_keys `command=`) of the s10-dev key: every session of that key runs inside the
+# proot Debian, so VS Code Remote-SSH finds a glibc Linux (its server does not run on Termux's bionic libc).
+# Port forwarding stays with the Termux sshd: the guest shares the network, so 127.0.0.1 is the same on both sides.
+# S10_DEV_DISTRO picks the proot-distro alias (default debian).
+DISTRO=${S10_DEV_DISTRO:-debian}
+if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
+    exec proot-distro login "$DISTRO" -- /bin/bash -lc "$SSH_ORIGINAL_COMMAND"
+fi
+exec proot-distro login "$DISTRO"
