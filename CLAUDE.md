@@ -17,12 +17,14 @@ Python 3 só stdlib (atheron = Debian, python3.13), bash, sh do Termux. Sem gere
 | Testes do instalador | `bash atheron/tests/test_installer.sh` |
 | Testes do wrapper `s10` | `bash nomad/tests/test_s10.sh` |
 | Testes do Wake-on-LAN | `bash atheron/tests/test_wol.sh` |
-| Lint | `shellcheck atheron/user-step-s10.sh atheron/user-step-s10-dev.sh atheron/tests/test_s10_dev.sh atheron/wol-atheron.sh atheron/tests/test_wol.sh nomad/s10 nomad/tests/test_s10.sh termux/tests/test_termux.sh atheron/tests/test_installer.sh windows/s10-dev.sh && shellcheck -s sh termux/bootstrap.sh termux/boot/*.sh termux/acordar-atheron termux/dev-setup.sh termux/s10-dev-shell` |
+| Lint | `shellcheck atheron/user-step-s10.sh atheron/user-step-s10-dev.sh atheron/tests/test_s10_dev.sh atheron/wol-atheron.sh atheron/tests/test_wol.sh nomad/s10 nomad/tests/test_s10.sh termux/tests/test_termux.sh atheron/tests/test_installer.sh windows/s10-dev.sh windows/s10-apps.sh windows/tests/test_s10_apps.sh atheron/dev/adb atheron/dev/s10-tela-web atheron/dev/install-dev.sh atheron/tests/test_dev_adb.sh atheron/tests/test_dev_tela.sh && shellcheck -s sh termux/bootstrap.sh termux/boot/*.sh termux/acordar-atheron termux/dev-setup.sh termux/s10-dev-shell atheron/dev/s10-adb.env.sh` |
 | Wake-on-LAN no atheron (root) | `/usr/local/sbin/cerberus-wol` (cópia de `atheron/wol-atheron.sh`; `--check`, `--undo`) |
 | Instalar no atheron (USUÁRIO) | `bash atheron/user-step-s10.sh` (`--check`, `--undo`) |
 | Bootstrap do Termux (USUÁRIO) | ver README.md, seção Termux |
 | Ambiente do VS Code (USUÁRIO, root no atheron) | `bash atheron/user-step-s10-dev.sh <chave.pub>` (pelo USB; roda `termux/dev-setup.sh` no Termux), ver README.md, seção "Desenvolver no S10" |
 | Testes do passo do VS Code | `bash atheron/tests/test_s10_dev.sh` |
+| Testes da conta de dev / tela | `bash atheron/tests/test_dev_adb.sh; bash atheron/tests/test_dev_tela.sh; bash windows/tests/test_s10_apps.sh; podman run --rm -v "$PWD:/repo:Z" -w /repo mcr.microsoft.com/powershell:lts-ubuntu-22.04 pwsh -NoProfile -File windows/tests/test_s10_tela.ps1` |
+| Testar apps no S10 (USUÁRIO, Windows) | `windows/s10-apps.sh` (root no atheron + Windows), ver README.md, seção "Testar apps no S10" |
 | Instalar o wrapper (nomad) | `install -m755 nomad/s10 ~/.local/bin/s10; install -D -m600 nomad/s10.local.conf ~/.config/s10/config; install -m644 nomad/s10.desktop ~/.local/share/applications/` |
 
 ## Valores do site
@@ -33,6 +35,7 @@ IPs, MAC, SSID/BSSID, serial e usuário do Termux NÃO ficam no git: cada parte 
 - `termux/`: `bootstrap.sh` (roda dentro do Termux; grava `~/.s10.conf` a partir de `s10.local.conf`), `boot/10-sshd.sh`, `boot/20-guardian.sh` (vigia do celular), `tests/`, `authorized_keys.example`.
 - `nomad/`: `s10` (wrapper scrcpy), `s10.desktop`, `tests/test_s10.sh` (ssh/adb/scrcpy falsos no PATH).
 - VS Code Remote-SSH: chave `s10-dev` com `command=` (`termux/s10-dev-shell`) leva a sessão ao Debian do `proot-distro`; sem sshd no proot (o `chroot` da separação de privilégios falha) e sem porta nova. Reparo `phantom_procs` no guardião (limite de 32 processos fantasmas do Android 12).
+- Testar apps a partir do atheron: conta `claude` no grupo `cerberus-s10` (`--dev-user`), `atheron/dev/` (adb de proteção que recusa kill-server/tcpip/-a etc., `ADB_SERVER_SOCKET`, `s10-tela-web` = noVNC em 127.0.0.1:6080 via `adb forward` 15900→5900, unit com `sg`); scrcpy do Windows por `s10tunnel` (porta local 15037). Senha do VNC só no `#` da URL.
 - Wake-on-LAN: `atheron/wol-atheron.sh` (regra udev `81-cerberus-wol.rules`, não mexe em `/etc/network/interfaces`, que é gerado pelo cerberus-ia/net) + `termux/acordar-atheron` (pacote mágico por `socat`, dash sem `\x`) + `s10 acordar-atheron` (fala direto com o Termux, nunca via atheron). Automático no `20-guardian.sh`: Wi-Fi de casa caído → de volta dispara `acordar-atheron` se o atheron não responde (`~/.acordar-atheron.off` desliga). Não dá para simular a queda pelo adb: o `cerberus-s10` religa o Wi-Fi em ≤30 s, antes do ciclo de 60 s do vigia.
 
 - Resumo público: `public_summary()` publica `/run/cerberus-s10-publico/resumo.json` (0644) por LISTA PERMITIDA (sem IP/porta/serial); nunca copie/filtre o `estado.json` (privado, 0640) para ele. O formato é contrato do painel do Kindle (`versao: 1`).

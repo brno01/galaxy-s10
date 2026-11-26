@@ -60,5 +60,49 @@ ok "unit: no Environment for the public path (default in code)" "! grep -q S10_P
 ok "tmpfiles: public dir 0755 cerberus-s10" "grep -qx 'd /run/cerberus-s10-publico 0755 cerberus-s10 cerberus-s10 -' '$HERE/../cerberus-s10-publico.tmpfiles'"
 ok "installer installs and removes the tmpfiles" "grep -q 'tmpfiles.d/cerberus-s10-publico.conf' '$HERE/../user-step-s10.sh' && grep -q 'systemd-tmpfiles --create' '$HERE/../user-step-s10.sh'"
 ok "installer --check looks at resumo.json mode" "grep -q 'resumo.json' '$HERE/../user-step-s10.sh'"
+# --dev-user / --dev-user-undo: a development account gets the adb socket (group) and the VNC password (0600)
+mkdir -p "$T/bin" "$T/devhome"
+# fake id/usermod/gpasswd/getent record calls; the "dev" account exists, "ghost" does not
+cat > "$T/bin/getent" <<EOF2
+#!/bin/sh
+[ "\$1 \$2" = "passwd dev" ] && { echo "dev:x:1500:1500::$T/devhome:/bin/bash"; exit 0; }
+[ "\$1 \$2" = "passwd root" ] && { echo "root:x:0:0::/root:/bin/bash"; exit 0; }
+exit 2
+EOF2
+# shellcheck disable=SC2016  # literal $LOG_DEV in the fakes
+for c in usermod gpasswd; do printf '#!/bin/sh\necho "%s $*" >> "$LOG_DEV"\n' "$c" > "$T/bin/$c"; done
+# shellcheck disable=SC2016
+printf '#!/bin/sh\nif [ "$1" = -nG ]; then [ -e "$GROUP_MEMBER" ] && echo "dev cerberus-s10" || echo dev; exit 0; fi\nexec /usr/bin/id "$@"\n' > "$T/bin/id"
+# fake runuser: records who it runs as, then runs the command (same uid in the tests)
+# shellcheck disable=SC2016
+printf '#!/bin/sh\necho "runuser $1 $2" >> "$LOG_DEV"\nshift 3\nexec "$@"\n' > "$T/bin/runuser"
+chmod +x "$T"/bin/*
+export LOG_DEV=$T/devcalls GROUP_MEMBER=$T/member S10_RUNUSER=$T/bin/runuser
+FAKE_PW=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12)   # random per run: no credential-looking literal in git
+printf '%s\n' "$FAKE_PW" > "$T/etc/vnc-password"; chmod 600 "$T/etc/vnc-password"
+: > "$LOG_DEV"
+PATH="$T/bin:$PATH" bash "$INST" --dev-user dev > "$T/out" 2>&1; rc=$?
+ok "dev-user exits 0" "[ $rc -eq 0 ]"
+ok "dev-user adds the account to cerberus-s10" "grep -qx 'usermod -aG cerberus-s10 dev' '$LOG_DEV'"
+ok "dev-user copies the VNC password 0600 into the account" "cmp -s '$T/etc/vnc-password' '$T/devhome/.config/s10/vnc-password' && [ \"\$(stat -c %a '$T/devhome/.config/s10/vnc-password')\" = 600 ] && [ \"\$(stat -c %a '$T/devhome/.config/s10')\" = 700 ]"
+ok "dev-user says a new login is needed" "grep -q 'login' '$T/out'"
+ok "the copy is written AS the account (root never writes in its home)" "grep -qx 'runuser -u dev' '$LOG_DEV' && ! grep -q 'cp \"\$PWFILE\"' '$INST'"
+ok "dev-user creates a missing ~/.config as the account" "[ -d '$T/devhome/.config' ]"
+: > "$LOG_DEV"; touch "$GROUP_MEMBER"
+PATH="$T/bin:$PATH" bash "$INST" --dev-user dev > "$T/out" 2>&1; rc=$?
+ok "dev-user idempotent: already a member, no usermod" "[ $rc -eq 0 ] && ! grep -q usermod '$LOG_DEV'"
+ok "rerun refreshes the password copy" "cmp -s '$T/etc/vnc-password' '$T/devhome/.config/s10/vnc-password'"
+for bad in root cerberus-s10 s10tunnel ghost ''; do
+    : > "$LOG_DEV"
+    PATH="$T/bin:$PATH" bash "$INST" --dev-user "$bad" > "$T/out" 2>&1; rc=$?
+    ok "dev-user refuses '$bad'" "[ $rc -ne 0 ] && [ ! -s '$LOG_DEV' ]"
+done
+: > "$LOG_DEV"
+PATH="$T/bin:$PATH" bash "$INST" --dev-user-undo dev > "$T/out" 2>&1; rc=$?
+ok "dev-user-undo removes the group and the password copy (as the account)" "[ $rc -eq 0 ] && grep -qx 'gpasswd -d dev cerberus-s10' '$LOG_DEV' && grep -qx 'runuser -u dev' '$LOG_DEV' && [ ! -e '$T/devhome/.config/s10/vnc-password' ]"
+rm -f "$GROUP_MEMBER"; : > "$LOG_DEV"
+PATH="$T/bin:$PATH" bash "$INST" --dev-user-undo dev > "$T/out" 2>&1; rc=$?
+ok "dev-user-undo idempotent: not a member, no gpasswd" "[ $rc -eq 0 ] && ! grep -q gpasswd '$LOG_DEV'"
+
 echo "--- $n checks, $fail failed"
 [ "$fail" -eq 0 ]

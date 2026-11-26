@@ -1,0 +1,17 @@
+[Unit]
+Description=S10 screen in a browser tab (noVNC on 127.0.0.1:6080 -> droidVNC-NG via adb forward)
+Documentation=https://github.com/brno01/galaxy-s10
+# the phone may be rebooting or the VNC restarting: keep trying, slowly
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=ADB_SERVER_SOCKET=localfilesystem:/run/cerberus-s10/adb.sock
+# sg: the systemd --user manager keeps the groups it started with; sg takes cerberus-s10 from /etc/group, so a
+# membership granted later works without restarting the whole user manager
+ExecStart=/usr/bin/sg cerberus-s10 -c "exec %h/.local/bin/s10-tela-web run"
+Restart=on-failure
+RestartSec=20
+
+[Install]
+WantedBy=default.target

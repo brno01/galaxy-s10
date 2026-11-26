@@ -1,0 +1,63 @@
+#!/bin/bash
+# S10 screen in a browser tab (VS Code Simple Browser) for a development account on the atheron.
+#   run      foreground, for the systemd --user unit: `adb forward` to the droidVNC-NG on the phone (loopback, password
+#            protected) + websockify serving noVNC on 127.0.0.1:$S10_WEB_PORT (HTTP and the VNC websocket, one port)
+#   start | stop | restart | status    the systemd --user unit s10-tela-web.service
+#   url      the address to open (password in the #fragment: browsers never send it to the server, so no log has it)
+# Installed by atheron/dev/install-dev.sh. Needs the cerberus-s10 group (user-step-s10.sh --dev-user <user>).
+set -euo pipefail
+
+WEB_PORT=${S10_WEB_PORT:-6080}
+VNC_FWD=${S10_VNC_FWD:-15900}        # atheron loopback port the adb server forwards to the phone
+VNC_PHONE=${S10_VNC_PHONE:-5900}     # droidVNC-NG on the phone (lo only)
+NOVNC_DIR=${S10_NOVNC_DIR:-$HOME/.local/share/s10-tela-web/novnc}
+WEBSOCKIFY=${S10_WEBSOCKIFY:-$HOME/.local/bin/websockify}
+PWFILE=${S10_VNC_PASSWORD_FILE:-$HOME/.config/s10/vnc-password}
+ADB=${S10_ADB:-adb}
+SYSTEMCTL=${S10_SYSTEMCTL:-systemctl}
+UNIT=s10-tela-web.service
+export ADB_SERVER_SOCKET=${ADB_SERVER_SOCKET:-localfilesystem:/run/cerberus-s10/adb.sock}
+
+die() { echo "s10-tela-web: $*" >&2; exit 1; }
+
+device_ready() {
+    local state
+    state=$("$ADB" get-state 2>/dev/null || true)
+    [ "$state" = device ] && return 0
+    if [ ! -r "${ADB_SERVER_SOCKET#localfilesystem:}" ]; then
+        die "sem acesso ao adb do S10 (${ADB_SERVER_SOCKET#localfilesystem:}): esta conta precisa do grupo cerberus-s10 (root: user-step-s10.sh --dev-user $(id -un)) e de um login novo"
+    fi
+    die "S10 não está pronto no adb (estado: ${state:-ausente})"
+}
+
+run() {
+    [ -x "$WEBSOCKIFY" ] || die "websockify não instalado ($WEBSOCKIFY): rode atheron/dev/install-dev.sh"
+    [ -f "$NOVNC_DIR/vnc.html" ] || die "noVNC não instalado ($NOVNC_DIR): rode atheron/dev/install-dev.sh"
+    device_ready
+    if ! "$ADB" shell "ss -ltn 2>/dev/null | grep -q ':$VNC_PHONE '"; then
+        die "o droidVNC-NG não está escutando na :$VNC_PHONE do celular (o guardião cerberus-s10 o religa; veja journalctl -u cerberus-s10)"
+    fi
+    local child=
+    "$ADB" forward "tcp:$VNC_FWD" "tcp:$VNC_PHONE" > /dev/null
+    trap '"$ADB" forward --remove "tcp:$VNC_FWD" > /dev/null 2>&1 || true' EXIT
+    trap '[ -n "$child" ] && kill "$child" 2>/dev/null; exit 143' TERM INT
+    echo "s10-tela-web: http://localhost:$WEB_PORT/vnc.html  (VNC do S10 via 127.0.0.1:$VNC_FWD)"
+    "$WEBSOCKIFY" --web "$NOVNC_DIR" "127.0.0.1:$WEB_PORT" "127.0.0.1:$VNC_FWD" &
+    child=$!
+    wait "$child"
+}
+
+url() {
+    local frag="autoconnect=1&resize=scale&reconnect=1&show_dot=1"
+    if [ -s "$PWFILE" ]; then
+        frag="$frag&password=$(head -n 1 "$PWFILE")"
+    fi
+    echo "http://localhost:$WEB_PORT/vnc.html#$frag"
+}
+
+case "${1:-}" in
+run) run ;;
+start|stop|restart|status) exec "$SYSTEMCTL" --user "$1" "$UNIT" ;;
+url) url ;;
+*) echo "uso: $(basename "$0") run|start|stop|restart|status|url" >&2; exit 2 ;;
+esac
