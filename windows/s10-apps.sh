@@ -8,12 +8,23 @@
 #   3. Windows: scrcpy (winget), %LOCALAPPDATA%\s10\s10-tela.ps1, apelidos s10-tela e atheron-claude no ~/.ssh/config,
 #      atalho "S10 tela" no menu Iniciar com Ctrl+Alt+S, e no VS Code: encaminhamento da 6080 no Remote-SSH e
 #      Ctrl+Alt+Shift+S abrindo a tela numa aba.
-# Uso: ssh root@atheron cat /home/claude/development/personal/galaxy-s10/windows/s10-apps.sh > /tmp/s10-apps.sh && bash /tmp/s10-apps.sh
+#   --trabalho: também a conta de trabalho (clubpetro), pelo intermediário s10-trabalho-adb (sem entrar no grupo do
+#      adb; janela de 8 h aberta com `ssh atheron-claude s10-trabalho liga`) e o apelido atheron-trabalho.
+# Uso: ssh root@atheron cat /home/claude/development/personal/galaxy-s10/windows/s10-apps.sh > /tmp/s10-apps.sh && bash /tmp/s10-apps.sh [--trabalho]
 set -euo pipefail
 
 REPO=${S10_REPO:-/home/claude/development/personal/galaxy-s10}
 ATHERON=${S10_ATHERON:-root@atheron}
 DEV_USER=${S10_DEV_USER:-claude}
+WORK_USER=${S10_WORK_USER:-clubpetro}
+TRABALHO=0
+case "${1:-}" in
+--trabalho) TRABALHO=1 ;;
+'') ;;
+*) echo "uso: $0 [--trabalho]" >&2; exit 2 ;;
+esac
+WORK_STEP=":"
+[ "$TRABALHO" -eq 0 ] || WORK_STEP="S10_WORK_USER=$WORK_USER S10_PERSONAL_USER=$DEV_USER bash $REPO/atheron/user-step-s10-trabalho.sh"
 KEY=$HOME/.ssh/s10-tela_ed25519
 CFG=$HOME/.ssh/config
 WEB_PORT=6080
@@ -45,6 +56,7 @@ bash $REPO/atheron/user-step-s10.sh --dev-user $DEV_USER
 dh=\$(getent passwd $DEV_USER | cut -d: -f6)
 asdev() { runuser -u $DEV_USER -- env HOME=\"\$dh\" XDG_RUNTIME_DIR=/run/user/\$(id -u $DEV_USER) PATH=\"\$dh/.local/bin:/usr/local/bin:/usr/bin:/bin\" \"\$@\"; }
 asdev bash $REPO/atheron/dev/install-dev.sh
+$WORK_STEP
 sed -n 's/^S10_ATHERON_ADDR=/SITE:ATHERON=/p' $REPO/nomad/s10.local.conf
 printf 'SITE:URL=%s\n' \"\$(asdev s10-tela-web url)\"
 printf 'SITE:PS1=%s\n' \"\$(base64 -w0 $REPO/windows/s10-tela.ps1)\"" > "$OUT" || {
@@ -94,6 +106,13 @@ add_host atheron-claude "Host atheron-claude
     Port 2222
     User $DEV_USER
     ServerAliveInterval 30"
+if [ "$TRABALHO" -eq 1 ]; then
+    add_host atheron-trabalho "Host atheron-trabalho
+    HostName $ATHERON_ADDR
+    Port 2222
+    User $WORK_USER
+    ServerAliveInterval 30"
+fi
 {
     printf '%s\n' "$outside"
     if [ -n "$hosts" ]; then
@@ -101,7 +120,7 @@ add_host atheron-claude "Host atheron-claude
     fi
 } > "$CFG.tmp"
 mv -f "$CFG.tmp" "$CFG"
-echo "$CFG: apelidos s10-tela e atheron-claude"
+echo "$CFG: apelidos s10-tela, atheron-claude$([ "$TRABALHO" -eq 0 ] || echo ' e atheron-trabalho')"
 # the restricted account only prints the S10 state: a good end-to-end test of the key and the port
 if ssh -n -o StrictHostKeyChecking=accept-new s10-tela 2>/dev/null | grep -q '"conectado"'; then
     echo "túnel s10-tela ok"
@@ -174,3 +193,7 @@ echo "Pronto."
 echo "  VS Code: Remote-SSH: Connect to Host... > atheron-claude (adb do S10 já funciona no terminal: adb devices)"
 echo "  Tela na aba: Ctrl+Alt+Shift+S (com a janela conectada ao atheron)"
 echo "  Janela nativa: Ctrl+Alt+S, ou menu Iniciar > S10 tela"
+if [ "$TRABALHO" -eq 1 ]; then
+    echo "  Trabalho: abra a janela de 8 h com: ssh atheron-claude s10-trabalho liga"
+    echo "    no VS Code conectado em atheron-trabalho: s10-adb devices, s10-run flutter run (a tela é o Ctrl+Alt+S)"
+fi

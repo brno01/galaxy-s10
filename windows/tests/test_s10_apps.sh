@@ -101,6 +101,16 @@ HAS_SCRCPY=1 run; rc=$?
 ok "root step fails: exit 1, its output shown, Windows untouched" "[ $rc -ne 0 ] && grep -q 'erro no atheron' '$T/out' && grep -q 'nada foi mudado no Windows' '$T/out' && cmp -s '$T/kb.before' '$CU/keybindings.json'"
 sed -i 's/; echo "erro no atheron"; exit 1//' "$T/bin/ssh"
 
+# --trabalho: the work step runs in the same root ssh, and the work alias appears; without it, neither
+run_trab() { : > "$CALLS"; HOME=$T/home PATH="$T/bin:$PATH" bash "$APPS" "$@" > "$T/out" 2>&1; }
+HAS_SCRCPY=1 run_trab; rc=$?
+ok "without --trabalho: no work step, no work alias" "[ $rc -eq 0 ] && ! grep -q 'user-step-s10-trabalho' '$T/remote.sh' && ! grep -q '^Host atheron-trabalho' '$T/home/.ssh/config'"
+HAS_SCRCPY=1 run_trab --trabalho; rc=$?
+ok "--trabalho: work step for clubpetro opened by claude" "[ $rc -eq 0 ] && grep -q 'S10_WORK_USER=clubpetro S10_PERSONAL_USER=claude bash .*/atheron/user-step-s10-trabalho.sh' '$T/remote.sh'"
+ok "--trabalho: atheron-trabalho alias (clubpetro, 2222) and the hint" "grep -A3 '^Host atheron-trabalho\$' '$T/home/.ssh/config' | grep -q 'User clubpetro' && grep -q 's10-trabalho liga' '$T/out'"
+HAS_SCRCPY=1 run_trab --bogus; rc=$?
+ok "unknown option: usage, exit 2" "[ $rc -eq 2 ]"
+
 # the user already forwards ports: their setting is left alone, with a hint
 printf '{\n    "remote.SSH.defaultForwardedPorts": [{"localPort": 3000, "remotePort": 3000}]\n}\n' > "$CU/settings.json"
 HAS_SCRCPY=1 run

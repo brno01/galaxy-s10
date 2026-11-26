@@ -1,0 +1,30 @@
+#!/bin/bash
+# Window of the work account's access to the S10 (broker s10-trabalho-adb). For the personal account (claude) and
+# the owner; the work account itself cannot open the window.
+#   s10-trabalho liga        open (closes by itself after 8 h; `liga` again restarts the 8 h)
+#   s10-trabalho desliga     close now
+#   s10-trabalho status      open or closed, and until when
+#   s10-trabalho log [N]     the broker's last N decisions (OK / RECUSADO), default 40
+set -euo pipefail
+UNIT=s10-trabalho-adb.service
+SYSTEMCTL=${S10_SYSTEMCTL:-systemctl}
+SUDO=${S10_SUDO:-sudo}
+JOURNALCTL=${S10_JOURNALCTL:-journalctl}
+
+status() {
+    if "$SYSTEMCTL" is-active --quiet "$UNIT"; then
+        local since
+        since=$("$SYSTEMCTL" show -p ActiveEnterTimestamp --value "$UNIT")
+        echo "S10 para o trabalho: ABERTO desde $since (fecha sozinho 8 h depois; s10-trabalho desliga fecha já)"
+    else
+        echo "S10 para o trabalho: fechado (s10-trabalho liga abre por 8 h)"
+    fi
+}
+
+case "${1:-status}" in
+liga) "$SUDO" -n "$SYSTEMCTL" restart "$UNIT"; status ;;
+desliga) "$SUDO" -n "$SYSTEMCTL" stop "$UNIT"; status ;;
+status) status ;;
+log) "$JOURNALCTL" -u "$UNIT" -n "${2:-40}" --no-pager -o short-iso ;;
+*) echo "uso: s10-trabalho liga|desliga|status|log [N]" >&2; exit 2 ;;
+esac

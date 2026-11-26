@@ -31,6 +31,7 @@ O adb do atheron **não tem listener TCP** (nem 5037): só o socket unix `/run/c
 | `nomad/` | `s10` (wrapper com 3 caminhos e `status`), `s10.desktop`, testes |
 | `windows/` | `s10-dev.sh` (VS Code no Debian do S10), `s10-apps.sh` + `s10-tela.ps1` (testar apps no S10 a partir do atheron: scrcpy e tela na aba), testes |
 | `atheron/dev/` | conta de desenvolvimento no atheron: `adb` de proteção, ambiente, `s10-tela-web` (noVNC) e `install-dev.sh` |
+| `atheron/s10-trabalho*`, `s10-adb`, `s10-run` | conta de trabalho: intermediário do adb com lista de permissões, janela de 8 h e instalador `user-step-s10-trabalho.sh` |
 
 ## Testes e CI
 
@@ -314,6 +315,39 @@ ssh root@atheron cat <checkout-no-atheron>/windows/s10-apps.sh > /tmp/s10-apps.s
 ```
 
 Ele cria a chave `s10-tela_ed25519` e, num ssh só como root, autoriza essa chave no `s10tunnel` (`--tunnel-key`), roda o `--dev-user claude` e o `install-dev.sh` como `claude`. No Windows, instala o scrcpy (winget) e o `%LOCALAPPDATA%\s10\s10-tela.ps1`, acrescenta os apelidos `s10-tela` e `atheron-claude` ao `~/.ssh/config` e cria o atalho "S10 tela" no menu Iniciar (Ctrl+Alt+S). No VS Code, acrescenta `remote.SSH.defaultForwardedPorts` (6080) e a tecla Ctrl+Alt+Shift+S. Os blocos dele nos JSON do VS Code ficam entre `// s10-begin` e `// s10-end` e são trocados a cada execução. Antes da primeira mudança ele guarda uma cópia `*.antes-s10`. Se o arquivo não começar com `{`/`[` numa linha só, ou se os marcadores estiverem desemparelhados, ele não mexe e avisa. Os apelidos SSH dele ficam num bloco `# s10-begin`/`# s10-end` do `~/.ssh/config`, refeito a cada execução; um `Host` com o mesmo nome escrito à mão fora do bloco é mantido.
+
+## Conta de trabalho (clubpetro) testando apps no S10
+
+A conta de trabalho do atheron é isolada de propósito (firewall do Cerberus, `net/user-step-clubpetro-firewall.sh`), porque o modelo de ameaça é "um agente hostil pode viver nela": sem LAN, sem tailnet e nunca o adb do `cerberus-s10`. Por isso ela **não** entra no grupo `cerberus-s10`. Ela fala com um intermediário, o `s10-trabalho-adb`: ele conversa no protocolo do servidor adb, deixa passar só o que um teste de app precisa, recusa o resto e registra tudo.
+
+```
+conta de trabalho ── s10-adb / s10-run ──▶ /run/s10-trabalho/adb.sock (grupo s10-trabalho) ──▶ s10-trabalho-adb ──▶ adb do cerberus-s10 ──▶ S10
+                                                                                  (decide cada pedido, journal)
+```
+
+- **Passa:** `devices`, `install`/`uninstall`, `logcat` (só leitura: sem `-f`, `-c`, `-G`...), `am start|force-stop|kill|broadcast`, `pm list|path|install|uninstall|clear|dump`, `cmd package|activity` com as mesmas regras, `getprop`, `dumpsys` de `package`/`meminfo`/`gfxinfo`/`cpuinfo`/`activity`/`window`/`display`..., `settings get`, `run-as` do app de trabalho, `monkey -p <app> [-v] [--throttle N] <eventos>`, `forward` de portas locais `tcp:0` ou 30000-65535 para portas do celular, `push`/`pull` só de arquivos comuns em `/data/local/tmp`, depuração (`jdwp`), `screencap`/`screenrecord` em `/data/local/tmp`.
+- **É recusado:**
+  - no servidor: `host:connect`/`pair`/`mdns` (o servidor adb roda fora do firewall e conectaria onde mandassem), `kill-server`, `killforward-all`, serial com `:` (use o serial do USB);
+  - no aparelho: `tcpip`, `usb`, `root`, `reboot`, `remount`, `dev:` (arquivos do aparelho), `reverse`, shell interativo;
+  - comandos: qualquer um fora da lista ou com sintaxe de shell (`;`, `|`, `$()`, crases, globs, redirecionamento fora de `/data/local/tmp`), `input`, `monkey --port`/`-f`, `am instrument` (um APK de instrumentação roda comandos como o shell), `pm grant`/`revoke` (daria permissões de sistema a um app), `settings put`;
+  - pacotes: qualquer coisa que cite Termux, Tailscale, droidVNC-NG ou Shizuku, e `clear`/`uninstall`/`force-stop`/`kill`/`run-as` em pacotes do sistema (`android`, `com.android.*`, `com.samsung.*`, `com.google.*`...). Com `S10_TRABALHO_PACOTES="br.com.empresa"` em `/etc/default/s10-trabalho`, só os pacotes com esses prefixos;
+  - portas: `forward` para o adb por rede (5555), o VNC e o sshd do Termux (as portas vêm da configuração do guardião);
+  - arquivos: links simbólicos e outros tipos especiais em `push` (o modo é lido como o `adbd` lê: octal, hexadecimal ou decimal).
+- **Limites:** até 32 conexões por conta, `TasksMax=64`, `MemoryMax=256M`. A unit não enxerga a chave adb do guardião nem os segredos do VNC (`InaccessiblePaths`).
+- **Janela de tempo:** o intermediário não sobe no boot. Na conta pessoal: `s10-trabalho liga` (abre por 8 h; rodar de novo reinicia as 8 h), `s10-trabalho desliga`, `s10-trabalho status`, `s10-trabalho log` (decisões OK/RECUSADO). Do Windows: `ssh atheron-claude s10-trabalho liga`. A conta de trabalho não consegue abrir a janela.
+- **Unit endurecida:** roda como `cerberus-s10`, só com sockets unix (`RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`) e sem reiniciar sozinha (se cair, a janela fecha).
+- **Na conta de trabalho:** `s10-adb devices`, `s10-adb install app.apk`, `s10-run flutter run`, `s10-run ./gradlew installDebug`. Só esses dois comandos usam o intermediário. O adb próprio da conta (o servidor dela em outra porta) continua como estava.
+- **Tela:** na janela do VS Code de trabalho, use o scrcpy do Windows (Ctrl+Alt+S), que é você mesmo no Windows. A aba noVNC fica só na conta pessoal: ela daria toque livre no celular, por fora do intermediário.
+
+**Risco que sobra (leia antes de ligar):** um APK instalado é um programa de verdade no S10. Com internet, ele alcança a LAN de casa, e um `forward` permitido dá à conta de trabalho um caminho até ele. Testar app exige instalar app, então o intermediário não fecha isso. Ele reduz e registra; o modelo "agente hostil na conta de trabalho" não vale para o S10 enquanto a janela estiver aberta. O que fecharia de vez é a rede: o S10 numa rede isolada do roteador (rede de convidados ou isolamento de clientes). Isso quebra o Wake-on-LAN do atheron e o adb sem fio pela LAN, que fazem parte deste projeto; fica como opção, não aplicada. O firewall da conta de trabalho é uma foto das portas do loopback no momento em que é aplicado: aplicá-lo de novo com a janela aberta pode bloquear um `forward` ativo.
+
+Outros limites conhecidos:
+- `screencap`, `screenrecord`, `uiautomator dump` e `framebuffer` leem o que estiver na tela do S10.
+- `jdwp` só alcança apps depuráveis num aparelho de produção (Termux e Tailscale de loja não são); num build `userdebug` ou com root alcançaria todos.
+- Um `forward` sem `norebind` numa porta 30000+ pode tomar um encaminhamento da conta pessoal na mesma porta.
+- Sem `am instrument`, testes instrumentados do Android ficam só na conta pessoal.
+
+**Passo do USUÁRIO:** `bash /tmp/s10-apps.sh --trabalho` (o mesmo comando da seção anterior, com a opção), ou direto no atheron, como root: `bash atheron/user-step-s10-trabalho.sh` (`--check`, `--undo`).
 
 ## Ligar o atheron pelo S10 (Wake-on-LAN)
 

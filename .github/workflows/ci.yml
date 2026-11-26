@@ -45,8 +45,10 @@ jobs:
           bash atheron/tests/test_dev_tela.sh
           bash windows/tests/test_s10_apps.sh
           pwsh -NoProfile -File windows/tests/test_s10_tela.ps1
+          python3 -I atheron/tests/test_s10_trabalho_adb.py
+          bash atheron/tests/test_s10_trabalho_install.sh
 
       - name: Shellcheck
         run: |
-          shellcheck -S warning atheron/user-step-s10.sh atheron/user-step-s10-dev.sh atheron/tests/test_s10_dev.sh atheron/wol-atheron.sh atheron/tests/test_wol.sh nomad/s10 nomad/tests/test_s10.sh termux/tests/test_termux.sh atheron/tests/test_installer.sh windows/s10-dev.sh windows/s10-apps.sh windows/tests/test_s10_apps.sh atheron/dev/adb atheron/dev/s10-tela-web atheron/dev/install-dev.sh atheron/tests/test_dev_adb.sh atheron/tests/test_dev_tela.sh
-          shellcheck -S warning -s sh termux/bootstrap.sh termux/boot/*.sh termux/acordar-atheron termux/dev-setup.sh termux/s10-dev-shell atheron/dev/s10-adb.env.sh
+          shellcheck -S warning atheron/user-step-s10.sh atheron/user-step-s10-dev.sh atheron/tests/test_s10_dev.sh atheron/wol-atheron.sh atheron/tests/test_wol.sh nomad/s10 nomad/tests/test_s10.sh termux/tests/test_termux.sh atheron/tests/test_installer.sh windows/s10-dev.sh windows/s10-apps.sh windows/tests/test_s10_apps.sh atheron/dev/adb atheron/dev/s10-tela-web atheron/dev/install-dev.sh atheron/tests/test_dev_adb.sh atheron/tests/test_dev_tela.sh atheron/s10-trabalho atheron/user-step-s10-trabalho.sh atheron/tests/test_s10_trabalho_install.sh
+          shellcheck -S warning -s sh termux/bootstrap.sh termux/boot/*.sh termux/acordar-atheron termux/dev-setup.sh termux/s10-dev-shell atheron/dev/s10-adb.env.sh atheron/s10-adb atheron/s10-run
